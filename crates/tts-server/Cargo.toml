@@ -1,0 +1,64 @@
+[package]
+name = "tts-server"
+description = "gRPC server for Qwen3-TTS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tts-server"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["audio-codec-12hz/cuda"]
+
+[dependencies]
+# Internal crates
+tts-core.workspace = true
+runtime.workspace = true
+audio-codec-12hz.workspace = true
+
+# CLI
+clap.workspace = true
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
+# Async runtime
+tokio.workspace = true
+tokio-stream = "0.1"
+futures.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging and metrics
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+# Utilities
+uuid.workspace = true
+parking_lot.workspace = true
+
+# HTTP for metrics/health
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = "1.4"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3.10"

@@ -8,6 +8,7 @@ members = [
     "crates/audio-codec-12hz",
     "crates/runtime",
     "crates/tts-cli",
+    "crates/tts-server",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ text-tokenizer = { path = "crates/text-tokenizer" }
 acoustic-model = { path = "crates/acoustic-model" }
 audio-codec-12hz = { path = "crates/audio-codec-12hz" }
 runtime = { path = "crates/runtime" }
+tts-server = { path = "crates/tts-server" }
 
 # Error handling
 thiserror = "2.0"

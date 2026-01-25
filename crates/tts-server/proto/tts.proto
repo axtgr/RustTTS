@@ -1,0 +1,160 @@
+// Qwen3-TTS gRPC API Definition
+syntax = "proto3";
+
+package tts.v1;
+
+// Text-to-Speech service
+service TtsService {
+  // Synthesize text to audio (unary)
+  rpc Synthesize(SynthesizeRequest) returns (SynthesizeResponse);
+  
+  // Synthesize text to audio stream (server streaming)
+  rpc SynthesizeStream(SynthesizeRequest) returns (stream AudioChunk);
+  
+  // Get service health status
+  rpc Health(HealthRequest) returns (HealthResponse);
+  
+  // Get service information
+  rpc GetInfo(InfoRequest) returns (InfoResponse);
+}
+
+// Language enum
+enum Language {
+  LANGUAGE_UNSPECIFIED = 0;
+  LANGUAGE_RU = 1;
+  LANGUAGE_EN = 2;
+  LANGUAGE_MIXED = 3;
+}
+
+// Audio format enum
+enum AudioFormat {
+  AUDIO_FORMAT_UNSPECIFIED = 0;
+  AUDIO_FORMAT_PCM_S16LE = 1;  // Raw PCM 16-bit signed little-endian
+  AUDIO_FORMAT_WAV = 2;        // WAV container
+}
+
+// Synthesis request
+message SynthesizeRequest {
+  // Text to synthesize (required)
+  string text = 1;
+  
+  // Target language (optional, defaults to RU)
+  Language language = 2;
+  
+  // Speaker ID for multi-speaker models (optional)
+  optional uint32 speaker_id = 3;
+  
+  // Output audio format (optional, defaults to PCM_S16LE)
+  AudioFormat audio_format = 4;
+  
+  // Sample rate in Hz (optional, defaults to 24000)
+  uint32 sample_rate = 5;
+  
+  // Random seed for deterministic generation (optional)
+  optional uint64 seed = 6;
+  
+  // Request ID for tracking (optional)
+  string request_id = 7;
+}
+
+// Synthesis response (unary)
+message SynthesizeResponse {
+  // Audio data
+  bytes audio_data = 1;
+  
+  // Audio format
+  AudioFormat audio_format = 2;
+  
+  // Sample rate in Hz
+  uint32 sample_rate = 3;
+  
+  // Number of audio samples
+  uint64 num_samples = 4;
+  
+  // Audio duration in milliseconds
+  float duration_ms = 5;
+  
+  // Processing time in milliseconds
+  float processing_time_ms = 6;
+  
+  // Real-time factor (processing_time / audio_duration)
+  float rtf = 7;
+  
+  // Request ID (echoed back)
+  string request_id = 8;
+}
+
+// Audio chunk for streaming
+message AudioChunk {
+  // Chunk index (0-based)
+  uint32 chunk_index = 1;
+  
+  // Audio data for this chunk
+  bytes audio_data = 2;
+  
+  // Sample rate in Hz
+  uint32 sample_rate = 3;
+  
+  // Number of samples in this chunk
+  uint32 num_samples = 4;
+  
+  // Start time of this chunk in milliseconds
+  float start_ms = 5;
+  
+  // Duration of this chunk in milliseconds
+  float duration_ms = 6;
+  
+  // Is this the final chunk?
+  bool is_final = 7;
+  
+  // Request ID (echoed back)
+  string request_id = 8;
+}
+
+// Health check request
+message HealthRequest {}
+
+// Health check response
+message HealthResponse {
+  // Service status
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SERVING = 1;
+    STATUS_NOT_SERVING = 2;
+  }
+  
+  Status status = 1;
+  
+  // Service version
+  string version = 2;
+  
+  // Uptime in seconds
+  uint64 uptime_seconds = 3;
+}
+
+// Info request
+message InfoRequest {}
+
+// Info response
+message InfoResponse {
+  // Service name
+  string name = 1;
+  
+  // Service version
+  string version = 2;
+  
+  // Model name
+  string model_name = 3;
+  
+  // Supported languages
+  repeated Language supported_languages = 4;
+  
+  // Default sample rate
+  uint32 default_sample_rate = 5;
+  
+  // Maximum text length
+  uint32 max_text_length = 6;
+  
+  // Number of available speakers
+  uint32 num_speakers = 7;
+}
