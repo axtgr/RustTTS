@@ -28,6 +28,42 @@ impl Default for SamplingConfig {
     }
 }
 
+impl SamplingConfig {
+    /// Create greedy sampling configuration (argmax, no randomness).
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0, // Will trigger argmax
+            top_k: 1,
+            top_p: 1.0,
+            seed: Some(0),
+        }
+    }
+
+    /// Create sampling with specific temperature.
+    pub fn with_temperature(temperature: f32) -> Self {
+        Self {
+            temperature,
+            ..Default::default()
+        }
+    }
+
+    /// Create top-k sampling configuration.
+    pub fn top_k(k: usize) -> Self {
+        Self {
+            top_k: k,
+            ..Default::default()
+        }
+    }
+
+    /// Create top-p (nucleus) sampling configuration.
+    pub fn top_p(p: f32) -> Self {
+        Self {
+            top_p: p,
+            ..Default::default()
+        }
+    }
+}
+
 /// Token sampler for autoregressive generation.
 #[derive(Debug)]
 pub struct Sampler {

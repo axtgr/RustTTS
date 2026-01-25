@@ -8,21 +8,26 @@
 //! - Rotary position embeddings (RoPE)
 //! - Streaming autoregressive generation
 //! - Multiple sampling strategies (greedy, top-k, top-p)
+//! - Multi-codebook prediction (MTP module)
 //!
 //! # Architecture
 //!
-//! The model follows the Qwen3-TTS architecture:
-//! - Embedding layer
-//! - N transformer blocks with:
-//!   - RMSNorm (pre-normalization)
-//!   - Multi-head attention with GQA (grouped query attention)
-//!   - MLP with SwiGLU activation
-//! - Output projection to acoustic token vocabulary
+//! The Qwen3-TTS-12Hz model uses a dual-track architecture:
+//!
+//! 1. **Talker (Main LM)**: Generates the zeroth (semantic) codebook tokens
+//!    - 28 transformer layers (0.6B) or 28 layers (1.7B)
+//!    - GQA with 16 heads, 8 KV heads
+//!    - Hidden size 1024 (0.6B) or 2048 (1.7B)
+//!
+//! 2. **Code Predictor (MTP)**: Predicts residual codebooks 1-15 from zeroth
+//!    - 5 transformer layers
+//!    - Parallel prediction of all residual codebooks
+//!    - Enables single-frame instant generation
 //!
 //! # Example
 //!
 //! ```ignore
-//! use acoustic_model::{Model, config::AcousticModelConfig, sampling::SamplingConfig};
+//! use acoustic_model::{Model, CodePredictor, config::AcousticModelConfig, sampling::SamplingConfig};
 //! use candle_core::Device;
 //!
 //! let config = AcousticModelConfig::default();
@@ -35,6 +40,7 @@
 //! ```
 
 pub mod cache;
+pub mod code_predictor;
 pub mod config;
 pub mod layers;
 pub mod model;
@@ -42,7 +48,8 @@ pub mod sampling;
 
 // Re-exports for convenience
 pub use cache::{CacheEntry, CacheHandle, KvCacheManager};
-pub use config::AcousticModelConfig;
+pub use code_predictor::{CodePredictor, MultiCodebookOutput};
+pub use config::{AcousticModelConfig, CodePredictorConfig};
 pub use layers::{Attention, MLP, RmsNorm, RotaryEmbedding, TransformerBlock};
 pub use model::{Model, StreamingGenerator};
 pub use sampling::{Sampler, SamplingConfig};
