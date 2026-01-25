@@ -70,19 +70,19 @@ impl Model {
         // Final norm
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
 
-        // LM head
+        // LM head (outputs to codec vocabulary)
         let lm_head = candle_nn::linear(
             config.hidden_size,
-            config.acoustic_vocab_size,
+            config.codec_vocab_size,
             vb.pp("lm_head"),
         )?;
 
         // Rotary embeddings
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config.head_dim;
         let rotary_emb = RotaryEmbedding::new(
             head_dim,
             config.max_position_embeddings,
-            config.rope_theta,
+            config.rope_theta as f32,
             device,
         )?;
 
@@ -298,18 +298,7 @@ mod tests {
     use super::*;
 
     fn test_config() -> AcousticModelConfig {
-        AcousticModelConfig {
-            hidden_size: 64,
-            num_attention_heads: 4,
-            num_kv_heads: 2,
-            num_layers: 2,
-            intermediate_size: 128,
-            text_vocab_size: 100,
-            acoustic_vocab_size: 50,
-            max_position_embeddings: 256,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-        }
+        AcousticModelConfig::tiny()
     }
 
     // Note: Full model tests require weight files
@@ -331,6 +320,6 @@ mod tests {
         // We can't test full generation without weights,
         // but we can verify the structure
         assert_eq!(sampling_config.temperature, 1.0);
-        assert_eq!(config.acoustic_vocab_size, 50);
+        assert_eq!(config.codec_vocab_size, 100);
     }
 }

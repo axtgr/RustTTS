@@ -9,18 +9,18 @@ use crate::config::AcousticModelConfig;
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
     weight: Tensor,
-    eps: f32,
+    eps: f64,
 }
 
 impl RmsNorm {
     /// Create a new RMSNorm layer.
-    pub fn new(hidden_size: usize, eps: f32, vb: VarBuilder) -> Result<Self> {
+    pub fn new(hidden_size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get((hidden_size,), "weight")?;
         Ok(Self { weight, eps })
     }
 
     /// Create RMSNorm with ones initialization (for testing).
-    pub fn new_ones(hidden_size: usize, eps: f32, device: &Device) -> Result<Self> {
+    pub fn new_ones(hidden_size: usize, eps: f64, device: &Device) -> Result<Self> {
         let weight = Tensor::ones((hidden_size,), DType::F32, device)?;
         Ok(Self { weight, eps })
     }
@@ -32,7 +32,7 @@ impl RmsNorm {
 
         // Compute RMS: sqrt(mean(x^2))
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let rms = (variance + self.eps as f64)?.sqrt()?;
+        let rms = (variance + self.eps)?.sqrt()?;
 
         // Normalize and scale
         let normalized = x.broadcast_div(&rms)?;

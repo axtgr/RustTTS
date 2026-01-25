@@ -53,11 +53,13 @@ mod tests {
 
     #[test]
     fn test_config_default() {
+        // Default is now Qwen3-TTS-12Hz-0.6B-Base
         let config = AcousticModelConfig::default();
-        assert_eq!(config.hidden_size, 2048);
-        assert_eq!(config.num_layers, 24);
+        assert_eq!(config.hidden_size, 1024);
+        assert_eq!(config.num_layers, 28);
         assert_eq!(config.num_attention_heads, 16);
-        assert_eq!(config.num_kv_heads, 4);
+        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.num_code_groups, 16);
     }
 
     #[test]
