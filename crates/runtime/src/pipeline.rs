@@ -3,13 +3,15 @@
 //! Combines all components: normalizer → tokenizer → acoustic model → codec.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_core::Device;
 use tracing::{debug, info, instrument};
 
+use acoustic_model::{Model as AcousticModel, SamplingConfig};
 use audio_codec_12hz::{Codec12Hz, DEFAULT_CROSSFADE_MS, StreamingDecoder};
 use text_normalizer::Normalizer;
-use text_tokenizer::{MockTokenizer, Tokenizer};
+use text_tokenizer::{MockTokenizer, Qwen3TTSTokens, Tokenizer};
 use tts_core::{
     AudioChunk, AudioCodec, Lang, NormText, SynthesisRequest, TextNormalizer, TextTokenizer,
     TtsError, TtsResult,
@@ -84,14 +86,36 @@ impl std::fmt::Debug for TokenizerBackend {
     }
 }
 
+/// Acoustic model backend - either mock or real neural model.
+enum AcousticBackend {
+    /// Mock acoustic generation (no model weights needed).
+    Mock,
+    /// Real neural acoustic model.
+    Neural(Arc<AcousticModel>),
+}
+
+impl std::fmt::Debug for AcousticBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mock => write!(f, "MockAcoustic"),
+            Self::Neural(_) => write!(f, "NeuralAcoustic"),
+        }
+    }
+}
+
 /// The main TTS pipeline combining all processing stages.
 ///
 /// Supports both mock (for testing) and real (with model weights) backends.
 pub struct TtsPipeline {
     normalizer: Normalizer,
     tokenizer: TokenizerBackend,
+    acoustic: AcousticBackend,
     codec: Codec12Hz,
     config: PipelineConfig,
+    /// Special token IDs for Qwen3-TTS.
+    special_tokens: Qwen3TTSTokens,
+    /// Device for tensor operations.
+    device: Device,
 }
 
 impl std::fmt::Debug for TtsPipeline {
@@ -112,8 +136,11 @@ impl TtsPipeline {
         Ok(Self {
             normalizer: Normalizer::new(),
             tokenizer: TokenizerBackend::Mock(MockTokenizer::new(65536)),
+            acoustic: AcousticBackend::Mock,
             codec: Codec12Hz::new_mock(),
             config,
+            special_tokens: Qwen3TTSTokens::default(),
+            device: Device::Cpu,
         })
     }
 
@@ -150,18 +177,41 @@ impl TtsPipeline {
         let codec = Codec12Hz::from_pretrained(codec_dir, device)?;
         info!("Audio codec loaded");
 
-        // Note: Acoustic model loading will be added when we integrate it
-        // For now, we use the tokenizer and codec with mock acoustic generation
+        // Try to load acoustic model if weights exist
+        let weights_path = talker_dir.join("model.safetensors");
+        let acoustic = if weights_path.exists() {
+            info!("Loading acoustic model from {}", talker_dir.display());
+            match AcousticModel::from_pretrained(talker_dir, device) {
+                Ok(model) => {
+                    info!(
+                        layers = model.config().num_layers,
+                        hidden = model.config().hidden_size,
+                        "Acoustic model loaded"
+                    );
+                    AcousticBackend::Neural(Arc::new(model))
+                }
+                Err(e) => {
+                    info!("Failed to load acoustic model: {}, using mock", e);
+                    AcousticBackend::Mock
+                }
+            }
+        } else {
+            info!("No model.safetensors found, using mock acoustic backend");
+            AcousticBackend::Mock
+        };
 
         let config = PipelineConfig::neural();
 
-        info!("Neural pipeline created (acoustic model pending)");
+        info!("Pipeline created with {:?} acoustic backend", acoustic);
 
         Ok(Self {
             normalizer: Normalizer::new(),
             tokenizer: TokenizerBackend::Real(Box::new(tokenizer)),
+            acoustic,
             codec,
             config,
+            special_tokens: Qwen3TTSTokens::default(),
+            device: device.clone(),
         })
     }
 
@@ -205,21 +255,95 @@ impl TtsPipeline {
         matches!(self.tokenizer, TokenizerBackend::Real(_))
     }
 
+    /// Check if using real (non-mock) acoustic model.
+    pub fn has_real_acoustic(&self) -> bool {
+        matches!(self.acoustic, AcousticBackend::Neural(_))
+    }
+
     /// Check if using real (non-mock) codec.
     pub fn has_real_codec(&self) -> bool {
         self.codec.is_neural()
     }
 
+    /// Check if all components are using real (non-mock) backends.
+    pub fn is_fully_neural(&self) -> bool {
+        self.has_real_tokenizer() && self.has_real_acoustic() && self.has_real_codec()
+    }
+
+    /// Get the device this pipeline is running on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Generate acoustic tokens from text tokens.
     ///
-    /// Note: This is a mock implementation that generates pseudo-random tokens.
+    /// Uses real acoustic model if available, otherwise falls back to mock.
     pub fn generate_acoustic(&self, text_tokens: &[u32], max_tokens: usize) -> TtsResult<Vec<u32>> {
         if text_tokens.is_empty() {
             return Err(TtsError::invalid_input("empty text tokens"));
         }
 
+        match &self.acoustic {
+            AcousticBackend::Neural(model) => {
+                self.generate_acoustic_neural(model, text_tokens, max_tokens)
+            }
+            AcousticBackend::Mock => self.generate_acoustic_mock(text_tokens, max_tokens),
+        }
+    }
+
+    /// Generate acoustic tokens using the neural model.
+    fn generate_acoustic_neural(
+        &self,
+        model: &AcousticModel,
+        text_tokens: &[u32],
+        max_tokens: usize,
+    ) -> TtsResult<Vec<u32>> {
+        // Build input sequence with special tokens:
+        // [tts_bos] [text_tokens...] [codec_bos]
+        let mut input_ids = Vec::with_capacity(text_tokens.len() + 2);
+        input_ids.push(self.special_tokens.tts_bos_token_id);
+        input_ids.extend_from_slice(text_tokens);
+        input_ids.push(self.special_tokens.codec_bos_id);
+
+        debug!(
+            input_len = input_ids.len(),
+            max_tokens = max_tokens,
+            "Starting neural acoustic generation"
+        );
+
+        // Configure sampling
+        let sampling_config = SamplingConfig {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 50,
+            seed: None,
+        };
+
+        // Generate acoustic tokens
+        let acoustic_tokens = model
+            .generate(
+                &input_ids,
+                max_tokens,
+                sampling_config,
+                Some(self.special_tokens.codec_eos_id),
+            )
+            .map_err(|e| TtsError::inference(format!("acoustic generation failed: {e}")))?;
+
+        debug!(
+            output_tokens = acoustic_tokens.len(),
+            "Neural acoustic generation complete"
+        );
+
+        Ok(acoustic_tokens)
+    }
+
+    /// Generate mock acoustic tokens (for testing without model weights).
+    fn generate_acoustic_mock(
+        &self,
+        text_tokens: &[u32],
+        max_tokens: usize,
+    ) -> TtsResult<Vec<u32>> {
         // Mock: generate acoustic tokens based on input
-        // Real implementation would use the acoustic model
         let num_tokens = (text_tokens.len() * 2).min(max_tokens);
         let acoustic_tokens: Vec<u32> = text_tokens
             .iter()
