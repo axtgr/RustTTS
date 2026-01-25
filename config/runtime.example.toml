@@ -1,0 +1,19 @@
+# Qwen3-TTS Runtime Configuration
+# Copy this file to runtime.toml and adjust settings
+
+[batching]
+max_batch_size = 8
+batch_window_ms = 10
+max_batch_tokens = 4096
+
+[queue]
+max_queue_size = 1000
+request_timeout_ms = 30000
+
+[logging]
+level = "info"    # trace, debug, info, warn, error
+format = "json"   # json or text
+
+[metrics]
+enabled = true
+port = 9090

@@ -1,0 +1,45 @@
+[package]
+name = "tts-cli"
+description = "Command-line interface for Qwen3-TTS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tts"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["acoustic-model/cuda", "audio-codec-12hz/cuda"]
+
+[dependencies]
+tts-core.workspace = true
+text-normalizer.workspace = true
+text-tokenizer.workspace = true
+acoustic-model.workspace = true
+audio-codec-12hz.workspace = true
+runtime.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"

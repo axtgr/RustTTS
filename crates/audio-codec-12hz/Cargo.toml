@@ -1,0 +1,43 @@
+[package]
+name = "audio-codec-12hz"
+description = "Qwen3-TTS-Tokenizer-12Hz audio codec decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda"]
+golden_tests = []
+
+[dependencies]
+tts-core.workspace = true
+
+# Tensor operations
+candle-core.workspace = true
+candle-nn.workspace = true
+safetensors.workspace = true
+
+# Audio processing
+hound.workspace = true
+rubato.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Utilities
+byteorder.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

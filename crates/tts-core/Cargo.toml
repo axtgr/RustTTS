@@ -1,0 +1,31 @@
+[package]
+name = "tts-core"
+description = "Core types, traits, and errors for Qwen3-TTS Rust Engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+# Error handling
+thiserror.workspace = true
+
+# Async
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

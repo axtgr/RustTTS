@@ -1,0 +1,28 @@
+[package]
+name = "text-tokenizer"
+description = "Text tokenization for Qwen3-TTS (BPE/Unigram compatible)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+golden_tests = []
+
+[dependencies]
+tts-core.workspace = true
+
+# Tokenization
+tokenizers.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,0 +1,28 @@
+[package]
+name = "text-normalizer"
+description = "Text normalization pipeline for Qwen3-TTS (RU/EN support)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+golden_tests = []
+
+[dependencies]
+tts-core.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Regex for pattern matching
+regex = "1.11"
+lazy_static = "1.5"
+
+[dev-dependencies]
+proptest.workspace = true

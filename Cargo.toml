@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tts-core",
+    "crates/text-normalizer",
+    "crates/text-tokenizer",
+    "crates/acoustic-model",
+    "crates/audio-codec-12hz",
+    "crates/runtime",
+    "crates/tts-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Qwen3-TTS Rust Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/qwen3-tts-rust"
+keywords = ["tts", "speech-synthesis", "qwen", "audio", "machine-learning"]
+categories = ["multimedia::audio", "science::machine-learning"]
+
+[workspace.dependencies]
+# Core crates (internal)
+tts-core = { path = "crates/tts-core" }
+text-normalizer = { path = "crates/text-normalizer" }
+text-tokenizer = { path = "crates/text-tokenizer" }
+acoustic-model = { path = "crates/acoustic-model" }
+audio-codec-12hz = { path = "crates/audio-codec-12hz" }
+runtime = { path = "crates/runtime" }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# ML / Tensor backend
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+safetensors = "0.5"
+
+# Tokenization
+tokenizers = "0.21"
+
+# Audio processing
+hound = "3.5"  # WAV I/O
+rubato = "0.16"  # Resampling
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Testing & Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.5"
+
+# Utilities
+byteorder = "1.5"
+parking_lot = "0.12"
+dashmap = "6.1"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
