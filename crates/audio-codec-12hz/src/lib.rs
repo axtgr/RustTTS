@@ -121,6 +121,40 @@ impl Codec12Hz {
         })
     }
 
+    /// Load codec from a pretrained model directory.
+    ///
+    /// Expects the directory to contain:
+    /// - `model.safetensors` - decoder weights
+    /// - `config.json` (optional) - decoder configuration
+    #[instrument(skip_all)]
+    pub fn from_pretrained(dir: impl AsRef<Path>, device: &Device) -> TtsResult<Self> {
+        let dir = dir.as_ref();
+        info!("Loading codec from pretrained directory: {}", dir.display());
+
+        // Load config if present, otherwise use default
+        let config_path = dir.join("config.json");
+        let config = if config_path.exists() {
+            DecoderConfig::from_json_file(&config_path)?
+        } else {
+            info!("No config.json found, using default Qwen3-TTS config");
+            DecoderConfig::default()
+        };
+
+        // Load weights
+        let weights_path = dir.join("model.safetensors");
+        if !weights_path.exists() {
+            return Err(TtsError::ModelLoad {
+                path: dir.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "model.safetensors not found in directory",
+                ),
+            });
+        }
+
+        Self::load_with_config(&weights_path, config, device)
+    }
+
     /// Check if using neural backend.
     pub fn is_neural(&self) -> bool {
         matches!(self.backend, DecoderBackend::Neural(_))

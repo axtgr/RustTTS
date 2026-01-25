@@ -18,6 +18,9 @@ text-tokenizer.workspace = true
 acoustic-model.workspace = true
 audio-codec-12hz.workspace = true
 
+# Tensor operations (for Device type)
+candle-core.workspace = true
+
 # Async runtime
 tokio.workspace = true
 futures.workspace = true

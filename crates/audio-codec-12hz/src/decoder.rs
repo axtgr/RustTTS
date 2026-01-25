@@ -10,6 +10,7 @@ use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
     conv_transpose1d, conv1d,
 };
+use serde_json::Value;
 use tracing::{debug, info, instrument};
 
 use tts_core::{TtsError, TtsResult};
@@ -55,6 +56,68 @@ impl Default for DecoderConfig {
 }
 
 impl DecoderConfig {
+    /// Load configuration from a JSON file (HuggingFace config.json format).
+    pub fn from_json_file(path: impl AsRef<Path>) -> TtsResult<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| TtsError::ModelLoad {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        Self::from_json(&content)
+    }
+
+    /// Parse configuration from JSON string (HuggingFace config.json format).
+    pub fn from_json(json: &str) -> TtsResult<Self> {
+        let v: Value = serde_json::from_str(json)
+            .map_err(|e| TtsError::config(format!("failed to parse JSON: {e}")))?;
+
+        // Helper to extract values with defaults
+        let get_usize = |key: &str, default: usize| -> usize {
+            v.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(default)
+        };
+
+        let get_f64 = |key: &str, default: f64| -> f64 {
+            v.get(key).and_then(|v| v.as_f64()).unwrap_or(default)
+        };
+
+        let get_u32 = |key: &str, default: u32| -> u32 {
+            v.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(default)
+        };
+
+        let get_vec_usize = |key: &str, default: Vec<usize>| -> Vec<usize> {
+            v.get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or(default)
+        };
+
+        Ok(Self {
+            codebook_size: get_usize("codebook_size", 2048),
+            codebook_dim: get_usize("codebook_dim", 512),
+            latent_dim: get_usize("latent_dim", 1024),
+            decoder_dim: get_usize("decoder_dim", 1536),
+            num_quantizers: get_usize("num_quantizers", 16),
+            num_semantic_quantizers: get_usize("num_semantic_quantizers", 1),
+            num_hidden_layers: get_usize("num_hidden_layers", 8),
+            num_attention_heads: get_usize("num_attention_heads", 16),
+            num_residual_blocks: get_usize("num_residual_blocks", 3),
+            upsample_rates: get_vec_usize("upsample_rates", vec![8, 5, 4, 3]),
+            upsampling_ratios: get_vec_usize("upsampling_ratios", vec![2, 2]),
+            sample_rate: get_u32("sample_rate", 24000),
+            rms_norm_eps: get_f64("rms_norm_eps", 1e-5),
+        })
+    }
+
     /// Configuration for Qwen3-TTS-Tokenizer-12Hz decoder.
     ///
     /// Based on config.json from HuggingFace:
@@ -941,6 +1004,61 @@ mod tests {
         // Wrong number of tokens for frame decode
         let tokens = vec![1, 2]; // Should be 4 (num_quantizers)
         let result = decoder.decode_frame(&tokens);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decoder_config_from_json() {
+        let json = r#"{
+            "codebook_size": 1024,
+            "codebook_dim": 256,
+            "latent_dim": 512,
+            "decoder_dim": 768,
+            "num_quantizers": 8,
+            "num_semantic_quantizers": 2,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_residual_blocks": 2,
+            "upsample_rates": [4, 4, 2, 2],
+            "upsampling_ratios": [2],
+            "sample_rate": 16000,
+            "rms_norm_eps": 1e-6
+        }"#;
+
+        let config = DecoderConfig::from_json(json).unwrap();
+
+        assert_eq!(config.codebook_size, 1024);
+        assert_eq!(config.codebook_dim, 256);
+        assert_eq!(config.latent_dim, 512);
+        assert_eq!(config.decoder_dim, 768);
+        assert_eq!(config.num_quantizers, 8);
+        assert_eq!(config.num_semantic_quantizers, 2);
+        assert_eq!(config.num_hidden_layers, 4);
+        assert_eq!(config.num_attention_heads, 8);
+        assert_eq!(config.num_residual_blocks, 2);
+        assert_eq!(config.upsample_rates, vec![4, 4, 2, 2]);
+        assert_eq!(config.upsampling_ratios, vec![2]);
+        assert_eq!(config.sample_rate, 16000);
+        // total upsample: 4*4*2*2 * 2 = 64 * 2 = 128
+        assert_eq!(config.total_upsample(), 128);
+    }
+
+    #[test]
+    fn test_decoder_config_from_json_defaults() {
+        // Minimal JSON - should use defaults
+        let json = r#"{"codebook_size": 512}"#;
+        let config = DecoderConfig::from_json(json).unwrap();
+
+        assert_eq!(config.codebook_size, 512);
+        // Check defaults are applied
+        assert_eq!(config.codebook_dim, 512);
+        assert_eq!(config.num_quantizers, 16);
+        assert_eq!(config.upsample_rates, vec![8, 5, 4, 3]);
+    }
+
+    #[test]
+    fn test_decoder_config_from_json_invalid() {
+        let result = DecoderConfig::from_json("not valid json");
         assert!(result.is_err());
     }
 }

@@ -2,11 +2,14 @@
 //!
 //! Combines all components: normalizer → tokenizer → acoustic model → codec.
 
+use std::path::Path;
+
+use candle_core::Device;
 use tracing::{debug, info, instrument};
 
 use audio_codec_12hz::{Codec12Hz, DEFAULT_CROSSFADE_MS, StreamingDecoder};
 use text_normalizer::Normalizer;
-use text_tokenizer::MockTokenizer;
+use text_tokenizer::{MockTokenizer, Tokenizer};
 use tts_core::{
     AudioChunk, AudioCodec, Lang, NormText, SynthesisRequest, TextNormalizer, TextTokenizer,
     TtsError, TtsResult,
@@ -66,13 +69,27 @@ impl PipelineConfig {
     }
 }
 
+/// Tokenizer backend - either mock or real.
+enum TokenizerBackend {
+    Mock(MockTokenizer),
+    Real(Box<Tokenizer>),
+}
+
+impl std::fmt::Debug for TokenizerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mock(_) => write!(f, "MockTokenizer"),
+            Self::Real(_) => write!(f, "Tokenizer"),
+        }
+    }
+}
+
 /// The main TTS pipeline combining all processing stages.
 ///
-/// This is a mock implementation for Phase 4.
-/// Full neural implementation will be added when model weights are available.
+/// Supports both mock (for testing) and real (with model weights) backends.
 pub struct TtsPipeline {
     normalizer: Normalizer,
-    tokenizer: MockTokenizer,
+    tokenizer: TokenizerBackend,
     codec: Codec12Hz,
     config: PipelineConfig,
 }
@@ -94,24 +111,72 @@ impl TtsPipeline {
 
         Ok(Self {
             normalizer: Normalizer::new(),
-            tokenizer: MockTokenizer::new(65536),
+            tokenizer: TokenizerBackend::Mock(MockTokenizer::new(65536)),
             codec: Codec12Hz::new_mock(),
             config,
         })
     }
 
-    /// Create a neural pipeline with loaded models.
+    /// Load pipeline from pretrained model directories.
     ///
-    /// Note: This is a placeholder. Full implementation requires model weights.
+    /// # Arguments
+    /// * `talker_dir` - Path to Qwen3-TTS talker model directory
+    /// * `tokenizer_dir` - Path to tokenizer directory (or same as talker_dir)
+    /// * `codec_dir` - Path to Qwen3-TTS-Tokenizer-12Hz directory
+    /// * `device` - Device to load models on (CPU or CUDA)
+    #[instrument(skip_all)]
+    pub fn from_pretrained(
+        talker_dir: impl AsRef<Path>,
+        tokenizer_dir: impl AsRef<Path>,
+        codec_dir: impl AsRef<Path>,
+        device: &Device,
+    ) -> TtsResult<Self> {
+        let talker_dir = talker_dir.as_ref();
+        let tokenizer_dir = tokenizer_dir.as_ref();
+        let codec_dir = codec_dir.as_ref();
+
+        info!(
+            "Loading pipeline from: talker={}, tokenizer={}, codec={}",
+            talker_dir.display(),
+            tokenizer_dir.display(),
+            codec_dir.display()
+        );
+
+        // Load tokenizer
+        let tokenizer = Tokenizer::from_pretrained(tokenizer_dir)?;
+        info!(vocab_size = tokenizer.vocab_size(), "Tokenizer loaded");
+
+        // Load audio codec
+        let codec = Codec12Hz::from_pretrained(codec_dir, device)?;
+        info!("Audio codec loaded");
+
+        // Note: Acoustic model loading will be added when we integrate it
+        // For now, we use the tokenizer and codec with mock acoustic generation
+
+        let config = PipelineConfig::neural();
+
+        info!("Neural pipeline created (acoustic model pending)");
+
+        Ok(Self {
+            normalizer: Normalizer::new(),
+            tokenizer: TokenizerBackend::Real(Box::new(tokenizer)),
+            codec,
+            config,
+        })
+    }
+
+    /// Create a neural pipeline with loaded models (legacy API).
+    ///
+    /// Note: Prefer using `from_pretrained()` instead.
     #[instrument(skip(_acoustic_model_path, _tokenizer_path, _codec_path))]
+    #[deprecated(since = "0.2.0", note = "Use from_pretrained() instead")]
     pub fn new_neural(
         _acoustic_model_path: impl AsRef<std::path::Path>,
         _tokenizer_path: impl AsRef<std::path::Path>,
         _codec_path: impl AsRef<std::path::Path>,
     ) -> TtsResult<Self> {
         // For now, return mock pipeline
-        // Full neural implementation will be added in later phases
-        info!("Neural pipeline requested, using mock for now");
+        info!("Legacy neural pipeline API called, using mock");
         Self::new_mock()
     }
 
@@ -128,8 +193,21 @@ impl TtsPipeline {
 
     /// Tokenize normalized text.
     pub fn tokenize(&self, text: &NormText) -> TtsResult<Vec<u32>> {
-        let seq = self.tokenizer.encode(text)?;
+        let seq = match &self.tokenizer {
+            TokenizerBackend::Mock(t) => t.encode(text)?,
+            TokenizerBackend::Real(t) => t.encode(text)?,
+        };
         Ok(seq.ids)
+    }
+
+    /// Check if using real (non-mock) tokenizer.
+    pub fn has_real_tokenizer(&self) -> bool {
+        matches!(self.tokenizer, TokenizerBackend::Real(_))
+    }
+
+    /// Check if using real (non-mock) codec.
+    pub fn has_real_codec(&self) -> bool {
+        self.codec.is_neural()
     }
 
     /// Generate acoustic tokens from text tokens.

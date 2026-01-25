@@ -15,9 +15,11 @@ pub mod metrics;
 pub mod pipeline;
 pub mod queue;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use candle_core::Device;
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
@@ -51,23 +53,29 @@ impl TtsRuntime {
         })
     }
 
-    /// Create a new TTS runtime with neural backend.
+    /// Create a new TTS runtime from pretrained model directories.
     ///
-    /// Note: Currently uses mock backend. Full neural implementation
-    /// will be added when model weights are available.
-    #[instrument(skip(config, acoustic_path, tokenizer_path, codec_path))]
-    pub fn new_neural(
+    /// # Arguments
+    /// * `config` - Runtime configuration
+    /// * `talker_dir` - Path to Qwen3-TTS talker model directory
+    /// * `tokenizer_dir` - Path to tokenizer directory
+    /// * `codec_dir` - Path to audio codec directory
+    /// * `device` - Device to load models on
+    #[instrument(skip_all)]
+    pub fn from_pretrained(
         config: RuntimeConfig,
-        acoustic_path: impl AsRef<std::path::Path>,
-        tokenizer_path: impl AsRef<std::path::Path>,
-        codec_path: impl AsRef<std::path::Path>,
+        talker_dir: impl AsRef<Path>,
+        tokenizer_dir: impl AsRef<Path>,
+        codec_dir: impl AsRef<Path>,
+        device: &Device,
     ) -> TtsResult<Self> {
-        info!("Initializing TTS runtime with neural backend");
+        info!("Initializing TTS runtime from pretrained models");
 
-        let pipeline = Arc::new(TtsPipeline::new_neural(
-            acoustic_path,
-            tokenizer_path,
-            codec_path,
+        let pipeline = Arc::new(TtsPipeline::from_pretrained(
+            talker_dir,
+            tokenizer_dir,
+            codec_dir,
+            device,
         )?);
         let queue = RequestQueue::new(config.queue.max_queue_size);
 
@@ -76,6 +84,20 @@ impl TtsRuntime {
             pipeline,
             queue,
         })
+    }
+
+    /// Create a new TTS runtime with neural backend (legacy API).
+    #[instrument(skip(config, _acoustic_path, _tokenizer_path, _codec_path))]
+    #[deprecated(since = "0.2.0", note = "Use from_pretrained() instead")]
+    #[allow(deprecated)]
+    pub fn new_neural(
+        config: RuntimeConfig,
+        _acoustic_path: impl AsRef<std::path::Path>,
+        _tokenizer_path: impl AsRef<std::path::Path>,
+        _codec_path: impl AsRef<std::path::Path>,
+    ) -> TtsResult<Self> {
+        info!("Legacy neural API called, using mock backend");
+        Self::new_mock(config)
     }
 
     /// Get the runtime configuration.
