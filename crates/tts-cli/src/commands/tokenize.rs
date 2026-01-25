@@ -32,7 +32,13 @@ pub fn run(input: &str, tokenizer_path: &Path) -> Result<()> {
     println!("  BOS: {:?}", tokenizer.bos_token_id());
     println!("  EOS: {:?}", tokenizer.eos_token_id());
     println!("  PAD: {:?}", tokenizer.pad_token_id());
+    println!("  Audio BOS: {:?}", tokenizer.audio_bos_token_id());
+    println!("  Audio EOS: {:?}", tokenizer.audio_eos_token_id());
     println!("  Vocab size: {}", tokenizer.vocab_size());
+
+    // Decode back to verify
+    let decoded = tokenizer.decode(&tokens)?;
+    println!("\nDecoded: {decoded}");
 
     Ok(())
 }

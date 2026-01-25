@@ -32,6 +32,8 @@ pub struct Tokenizer {
     bos_token_id: Option<u32>,
     eos_token_id: Option<u32>,
     pad_token_id: Option<u32>,
+    audio_bos_token_id: Option<u32>,
+    audio_eos_token_id: Option<u32>,
 }
 
 impl Tokenizer {
@@ -57,11 +59,22 @@ impl Tokenizer {
             .token_to_id("<pad>")
             .or_else(|| inner.token_to_id("<|pad|>"));
 
+        // Qwen3-TTS specific audio tokens
+        let audio_bos_token_id = inner
+            .token_to_id("<|audio_bos|>")
+            .or_else(|| inner.token_to_id("<|AUDIO|>"));
+
+        let audio_eos_token_id = inner
+            .token_to_id("<|audio_eos|>")
+            .or_else(|| inner.token_to_id("<|/AUDIO|>"));
+
         Ok(Self {
             inner,
             bos_token_id,
             eos_token_id,
             pad_token_id,
+            audio_bos_token_id,
+            audio_eos_token_id,
         })
     }
 
@@ -84,11 +97,22 @@ impl Tokenizer {
             .token_to_id("<pad>")
             .or_else(|| inner.token_to_id("<|pad|>"));
 
+        // Qwen3-TTS specific audio tokens
+        let audio_bos_token_id = inner
+            .token_to_id("<|audio_bos|>")
+            .or_else(|| inner.token_to_id("<|AUDIO|>"));
+
+        let audio_eos_token_id = inner
+            .token_to_id("<|audio_eos|>")
+            .or_else(|| inner.token_to_id("<|/AUDIO|>"));
+
         Ok(Self {
             inner,
             bos_token_id,
             eos_token_id,
             pad_token_id,
+            audio_bos_token_id,
+            audio_eos_token_id,
         })
     }
 
@@ -96,6 +120,135 @@ impl Tokenizer {
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.inner
     }
+
+    /// Get the audio BOS token ID (start of audio generation).
+    pub fn audio_bos_token_id(&self) -> Option<u32> {
+        self.audio_bos_token_id
+    }
+
+    /// Get the audio EOS token ID (end of audio generation).
+    pub fn audio_eos_token_id(&self) -> Option<u32> {
+        self.audio_eos_token_id
+    }
+
+    /// Lookup a token ID by its string representation.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// Lookup a token string by its ID.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    /// Encode text and prepend BOS token if present.
+    pub fn encode_with_bos(&self, text: &NormText) -> TtsResult<TokenSeq> {
+        let mut tokens = self.encode_raw(&text.text)?;
+
+        if let Some(bos_id) = self.bos_token_id {
+            tokens.ids.insert(0, bos_id);
+            tokens.offsets.insert(0, (0, 0));
+        }
+
+        Ok(tokens)
+    }
+
+    /// Encode text and append EOS token if present.
+    pub fn encode_with_eos(&self, text: &NormText) -> TtsResult<TokenSeq> {
+        let mut tokens = self.encode_raw(&text.text)?;
+
+        if let Some(eos_id) = self.eos_token_id {
+            let end_offset = text.text.len();
+            tokens.ids.push(eos_id);
+            tokens.offsets.push((end_offset, end_offset));
+        }
+
+        Ok(tokens)
+    }
+
+    /// Encode text with both BOS and EOS tokens.
+    pub fn encode_with_special_tokens(&self, text: &NormText) -> TtsResult<TokenSeq> {
+        let mut tokens = self.encode_raw(&text.text)?;
+
+        if let Some(bos_id) = self.bos_token_id {
+            tokens.ids.insert(0, bos_id);
+            tokens.offsets.insert(0, (0, 0));
+        }
+
+        if let Some(eos_id) = self.eos_token_id {
+            let end_offset = text.text.len();
+            tokens.ids.push(eos_id);
+            tokens.offsets.push((end_offset, end_offset));
+        }
+
+        Ok(tokens)
+    }
+
+    /// Encode raw text without the NormText wrapper.
+    fn encode_raw(&self, text: &str) -> TtsResult<TokenSeq> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| TtsError::tokenization(e.to_string()))?;
+
+        let ids: Vec<u32> = encoding.get_ids().to_vec();
+        let offsets: Vec<(usize, usize)> = encoding.get_offsets().to_vec();
+
+        Ok(TokenSeq::new(ids, offsets))
+    }
+
+    /// Encode text by sentences for streaming (low latency).
+    /// Returns an iterator over token sequences for each sentence.
+    pub fn encode_streaming<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = TtsResult<TokenSeq>> + 'a {
+        // Split by sentence-ending punctuation
+        let sentences = split_sentences(text);
+
+        sentences.into_iter().map(move |sentence| {
+            let encoding = self
+                .inner
+                .encode(sentence, false)
+                .map_err(|e| TtsError::tokenization(e.to_string()))?;
+
+            let ids: Vec<u32> = encoding.get_ids().to_vec();
+            let offsets: Vec<(usize, usize)> = encoding.get_offsets().to_vec();
+
+            Ok(TokenSeq::new(ids, offsets))
+        })
+    }
+}
+
+/// Split text into sentences for streaming tokenization.
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+
+    for (i, c) in text.char_indices() {
+        if c == '.' || c == '!' || c == '?' || c == ';' {
+            // Include the punctuation in the sentence
+            let end = i + c.len_utf8();
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = end;
+        }
+    }
+
+    // Add remaining text
+    let remaining = text[start..].trim();
+    if !remaining.is_empty() {
+        sentences.push(remaining);
+    }
+
+    // If no sentences found, return the whole text
+    if sentences.is_empty() && !text.trim().is_empty() {
+        sentences.push(text.trim());
+    }
+
+    sentences
 }
 
 impl TextTokenizer for Tokenizer {
