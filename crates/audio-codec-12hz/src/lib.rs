@@ -26,8 +26,9 @@ pub use decoder::{DecoderConfig, MockDecoder, NeuralDecoder};
 /// Default sample rate for the codec.
 pub const DEFAULT_SAMPLE_RATE: u32 = 24000;
 
-/// Default samples per acoustic token.
-pub const SAMPLES_PER_TOKEN: usize = 2000;
+/// Default samples per acoustic token (1920 for Qwen3-TTS at 12.5 Hz).
+/// At 24kHz sample rate: 24000 / 12.5 = 1920 samples per frame.
+pub const SAMPLES_PER_TOKEN: usize = 1920;
 
 /// Default crossfade duration in milliseconds.
 pub const DEFAULT_CROSSFADE_MS: f32 = 5.0;
