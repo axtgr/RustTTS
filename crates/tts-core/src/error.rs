@@ -41,6 +41,10 @@ pub enum TtsError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// Request queue is full.
+    #[error("request queue is full")]
+    QueueFull,
+
     /// Invalid input provided.
     #[error("invalid input: {0}")]
     InvalidInput(String),
@@ -90,6 +94,11 @@ impl TtsError {
     /// Create an invalid input error with message.
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput(msg.into())
+    }
+
+    /// Create a queue full error.
+    pub fn queue_full() -> Self {
+        Self::QueueFull
     }
 
     /// Create an internal error with message.
