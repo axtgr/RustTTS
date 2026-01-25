@@ -1,7 +1,7 @@
 # Архитектура Qwen3-TTS Rust Engine
 
 ## Общий обзор
-- Workspace из нескольких крейтов: `tts-core`, `text-normalizer`, `text-tokenizer`, `acoustic-model`, `audio-codec-12hz`, `runtime`, `tts-cli`, опц. `tts-server`.
+- Workspace из 8 крейтов: `tts-core`, `text-normalizer`, `text-tokenizer`, `acoustic-model`, `audio-codec-12hz`, `runtime`, `tts-cli`, `tts-server`.
 - Конвейер: normalize → tokenize → acoustic tokens → decode to PCM → чанки с overlap/crossfade → вывод (CLI/Server).
 - Цели: минимальная latency до первого аудио, RTF<0.2 на GPU, streaming 20–100 мс.
 
@@ -56,9 +56,11 @@
 - Режимы: файл → WAV; stdin → stream PCM stdout; параметры: язык, speaker_id, chunk_ms, device, fp16, seed.
 - Диагностика: `--bench` (локальный бенч), `--dry-run` (токены без декода).
 
-### tts-server (опционально)
-- gRPC или HTTP/2 streaming; endpoints: `/synthesize` (stream), `/health`, `/metrics`.
-- Auth токен; лимиты запросов; graceful shutdown; backpressure.
+### tts-server
+- gRPC сервер (tonic/prost): `Synthesize`, `SynthesizeStream`, `Health`, `GetInfo`.
+- HTTP endpoints (axum): `/health`, `/healthz`, `/ready`, `/info`, `/metrics`.
+- Graceful shutdown (SIGINT/SIGTERM); backpressure; конфигурация через CLI флаги.
+- Proto определения в `proto/tts.proto`.
 
 ## Структуры данных (примерно)
 - `NormText { text: String, lang: Lang, spans: Vec<SpanInfo> }`

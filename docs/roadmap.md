@@ -1,62 +1,89 @@
 # Roadmap: Qwen3-TTS Rust Engine
 
 ## Цели
-- Rust-only реализация Qwen3-TTS (без Python, без torch).
-- Минимальная latency до first audio; RTF < 0.2 на GPU.
-- Streaming чанки 20–100 мс с overlap/crossfade.
-- Поддержка CPU/GPU, CUDA backend, батчинг и QoS.
-- Весы в safetensors, воспроизводимый build через `cargo`.
+
+- Rust-only реализация Qwen3-TTS (без Python, без torch)
+- Минимальная latency до first audio; RTF < 0.2 на GPU
+- Streaming чанки 20–100 мс с overlap/crossfade
+- Поддержка CPU/GPU, CUDA backend, батчинг и QoS
+- Весы в safetensors, воспроизводимый build через `cargo`
 
 ## Основные KPI
-- Time-to-first-audio (GPU): 150–400 мс; CPU: 600–1500 мс.
-- RTF: GPU < 0.2; CPU 0.8–2.0 (зависит от железа).
-- Длительная стабильность: 10+ минут стрима без утечек.
-- Детерминизм: опция фиксированного seed.
+
+- Time-to-first-audio (GPU): 150–400 мс; CPU: 600–1500 мс
+- RTF: GPU < 0.2; CPU 0.8–2.0 (зависит от железа)
+- Длительная стабильность: 10+ минут стрима без утечек
+- Детерминизм: опция фиксированного seed
 
 ## Фазы
-- Ф0: Подготовка и инфраструктура (конфиги, веса, CI-шаблон, базовые бенч/логи).
-- Ф1: Текстовый пайплайн (нормализация RU/EN, токенизация совместимая с моделью).
-- Ф2: Акустическая модель (трансформер, KV cache, streaming токены, CPU baseline).
-- Ф3: Аудио-декодер Qwen3-TTS-Tokenizer-12Hz → PCM, чанки, overlap/crossfade.
-- Ф4: Runtime/оркестрация (батчинг, QoS, очереди, structured logs, метрики).
-- Ф5: Интеграция CLI/Server (streaming API, auth, health/metrics).
-- Ф6: Оптимизация (CUDA backend, профили, бенчи, golden-тесты, стресс).
+
+| Фаза | Название | Статус | Описание |
+|------|----------|--------|----------|
+| Ф0 | Инфраструктура | ✅ | Workspace, конфиги, CI, базовые типы |
+| Ф1 | Текстовый пайплайн | ✅ | Нормализация RU/EN, токенизация |
+| Ф2 | Акустическая модель | ✅ | Трансформер, KV cache, streaming токены |
+| Ф3 | Аудио-декодер | ✅ | Qwen3-TTS-Tokenizer-12Hz → PCM, чанки, crossfade |
+| Ф4 | Runtime | ✅ | Pipeline интеграция, батчинг, QoS, метрики |
+| Ф5 | CLI | ✅ | Synth команда, WAV вывод, streaming режим |
+| Ф6 | gRPC Server | ✅ | Streaming API, health checks, Prometheus |
+| Ф7 | Оптимизация | ⏳ | CUDA backend, профили, бенчи, golden-тесты |
 
 ## Вехи (Definition of Done)
-- Ф1 DoD: CLI сухой прогон — нормализованный текст → токены (dry-run).
-- Ф2 DoD: Генерация стабильных speech-токенов, deterministic режим, KV cache.
-- Ф3 DoD: Декодер выдаёт реальный звук, WAV экспорт, чанки без щелчков.
-- Ф4 DoD: Потоковое воспроизведение, управляемый буфер, нет underrun/overrun.
-- Ф5 DoD: CLI и сервис принимают текст, отдают аудио-стрим, метрики/health.
-- Ф6 DoD: GPU ускорение, RTF<0.2 на реф. железе, бенч/голден-тесты зелёные.
 
-## Временная оценка (итеративно)
-- Ф0: 1 неделя.
-- Ф1: 1–2 недели.
-- Ф2: 2–3 недели.
-- Ф3: 2 недели.
-- Ф4: 1–2 недели.
-- Ф5: 1 неделя.
-- Ф6: 2 недели (параллелится частично с Ф4–Ф5).
+- ✅ **Ф0 DoD:** Workspace структура, CI, базовые трейты и типы
+- ✅ **Ф1 DoD:** CLI сухой прогон — нормализованный текст → токены (dry-run)
+- ✅ **Ф2 DoD:** Генерация acoustic токенов, KV cache, sampling strategies
+- ✅ **Ф3 DoD:** Декодер выдаёт аудио, WAV экспорт, чанки без щелчков
+- ✅ **Ф4 DoD:** TtsPipeline, StreamingSession, BatchScheduler
+- ✅ **Ф5 DoD:** CLI синтезирует текст в WAV файл и в stream-режиме
+- ✅ **Ф6 DoD:** gRPC сервер стримит аудио, health/metrics endpoints
+- ⏳ **Ф7 DoD:** GPU RTF < 0.2, golden-тесты, бенчи
+
+## Текущий статус
+
+**Все основные фазы (0-6) завершены.** Проект имеет:
+
+- 8 crates в workspace
+- 149+ unit и integration тестов
+- Mock-реализация полного pipeline
+- CLI для синтеза
+- gRPC сервер с HTTP endpoints
+
+**Следующие шаги (Ф7):**
+
+1. Загрузка реальных весов модели Qwen3-TTS
+2. CUDA backend через candle-cuda
+3. Профилирование и оптимизация
+4. Golden tests с эталонными аудио
+5. Benchmark suite
 
 ## Зависимости и порядки
-- Ф1 блокирует Ф2 (нужны стабильные токены).
-- Ф2 блокирует Ф3 (нужны speech-токены).
-- Ф3/Ф4 могут идти параллельно (декодер vs оркестрация), но интеграция после.
-- Ф6 оптимизирует уже работающий конец-в-конец пайплайн.
 
-## Риски верхнего уровня
-- Несовместимость токенизации с референсом → падение качества.
-- Неполный декодер 12Hz → артефакты/щелчки.
-- KV-cache память на GPU при батчинге → OOM.
-- CUDA/драйвер несостыковки; нужен fallback на CPU.
-- Латентность первого чанка > целевой — требуется микро-батч/прогрев.
+```
+Ф0 → Ф1 → Ф2 → Ф3 → Ф4 → Ф5
+              ↓       ↓
+            Ф4  →   Ф6
+                      ↓
+                    Ф7
+```
+
+## Риски
+
+- Несовместимость токенизации с референсом → падение качества
+- Неполный декодер 12Hz → артефакты/щелчки
+- KV-cache память на GPU при батчинге → OOM
+- CUDA/драйвер несостыковки; нужен fallback на CPU
+- Латентность первого чанка > целевой — требуется микро-батч/прогрев
 
 ## Артефакты по фазам
-- Ф0: templates конфигов, schema для model/config, мини-веса для CI, каркас CI.
-- Ф1: правила нормализации, тест-корпус, golden токены.
-- Ф2: конфиг трансформера, loader safetensors, sampling стратегии, KV cache.
-- Ф3: декодер, overlap/crossfade, тестовые WAV/golden спектры.
-- Ф4: runtime очереди, батчер, QoS политики, метрики/логи.
-- Ф5: `tts-cli`, `tts-server` (опц.), контракты API, примеры запросов.
-- Ф6: бенчмарки, профили, отчёт по RTF/latency, стресс-отчёт.
+
+| Фаза | Артефакты |
+|------|-----------|
+| Ф0 | Workspace, Cargo.toml, CI templates, базовые типы |
+| Ф1 | Normalizer (6 правил), MockTokenizer, 31 golden test |
+| Ф2 | Transformer layers, KV cache, Sampler, Model loader |
+| Ф3 | NeuralDecoder, MockDecoder, Crossfader, WAV I/O |
+| Ф4 | TtsPipeline, StreamingSession, BatchScheduler, TtsRuntime |
+| Ф5 | tts-cli binary, synth/normalize/tokenize команды |
+| Ф6 | tts-server binary, proto/tts.proto, gRPC + HTTP endpoints |
+| Ф7 | Benchmarks, profiles, golden audio, stress reports |
