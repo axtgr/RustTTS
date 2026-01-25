@@ -208,3 +208,88 @@ fn test_long_text() {
         "Long text should produce long audio"
     );
 }
+
+// ============================================================================
+// Golden Tests (require model weights)
+// Run with: cargo test --features golden_tests
+// ============================================================================
+
+/// Test loading real tokenizer from pretrained directory.
+#[test]
+#[ignore] // Enable with --ignored when models are downloaded
+#[cfg(feature = "golden_tests")]
+fn test_load_real_tokenizer() {
+    use std::path::Path;
+
+    let model_dir = Path::new("../../models/qwen3-tts-0.6b");
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let tokenizer = text_tokenizer::Tokenizer::from_pretrained(model_dir).unwrap();
+
+    // Verify vocab size matches Qwen3-TTS
+    assert_eq!(tokenizer.vocab_size(), 151936, "Qwen3-TTS vocab size");
+
+    // Test encoding
+    let text = tts_core::NormText::new("Hello world", tts_core::Lang::En);
+    let tokens = tokenizer.encode(&text).unwrap();
+    assert!(!tokens.ids.is_empty(), "Should produce tokens");
+
+    // Verify special token IDs
+    assert_eq!(tokenizer.tts_bos_token_id(), 151672);
+    assert_eq!(tokenizer.tts_eos_token_id(), 151673);
+}
+
+/// Test loading real audio codec from pretrained directory.
+#[test]
+#[ignore]
+#[cfg(feature = "golden_tests")]
+fn test_load_real_codec() {
+    use candle_core::Device;
+    use std::path::Path;
+
+    let codec_dir = Path::new("../../models/qwen3-tts-tokenizer");
+    if !codec_dir.exists() {
+        eprintln!(
+            "Skipping test: codec directory not found at {}",
+            codec_dir.display()
+        );
+        return;
+    }
+
+    let device = Device::Cpu;
+    let codec = audio_codec_12hz::Codec12Hz::from_pretrained(codec_dir, &device).unwrap();
+
+    assert!(codec.is_neural(), "Should use neural backend");
+    assert_eq!(codec.sample_rate(), 24000);
+}
+
+/// Test full pipeline with real models.
+#[test]
+#[ignore]
+#[cfg(feature = "golden_tests")]
+fn test_real_pipeline() {
+    use candle_core::Device;
+    use std::path::Path;
+
+    let talker_dir = Path::new("../../models/qwen3-tts-0.6b");
+    let tokenizer_dir = talker_dir;
+    let codec_dir = Path::new("../../models/qwen3-tts-tokenizer");
+
+    if !talker_dir.exists() || !codec_dir.exists() {
+        eprintln!("Skipping test: model directories not found");
+        return;
+    }
+
+    let device = Device::Cpu;
+    let pipeline =
+        TtsPipeline::from_pretrained(talker_dir, tokenizer_dir, codec_dir, &device).unwrap();
+
+    assert!(pipeline.has_real_tokenizer(), "Should use real tokenizer");
+    assert!(pipeline.has_real_codec(), "Should use real codec");
+}

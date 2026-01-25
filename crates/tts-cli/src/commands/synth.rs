@@ -4,37 +4,78 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use candle_core::Device;
 use tracing::{debug, info};
 
 use audio_codec_12hz::wav::write_wav;
 use runtime::TtsPipeline;
 use tts_core::Lang;
 
+/// Options for synthesis command.
+pub struct SynthOptions {
+    pub input: String,
+    pub output: PathBuf,
+    pub lang: String,
+    pub speaker: Option<u32>,
+    pub model_dir: Option<PathBuf>,
+    pub codec_dir: Option<PathBuf>,
+    /// Legacy model config path (reserved for future use).
+    #[allow(dead_code)]
+    pub model_config: Option<PathBuf>,
+    /// Random seed for reproducible generation (reserved for future use).
+    #[allow(dead_code)]
+    pub seed: Option<u64>,
+}
+
+/// Create pipeline based on options.
+fn create_pipeline(options: &SynthOptions) -> Result<TtsPipeline> {
+    if let Some(ref model_dir) = options.model_dir {
+        info!(model_dir = %model_dir.display(), "Loading pretrained model");
+
+        // Use model_dir for both talker and tokenizer
+        let tokenizer_dir = model_dir;
+
+        // Codec dir - use provided or default
+        let codec_dir = options.codec_dir.clone().unwrap_or_else(|| {
+            // Try to find codec in parent directory
+            model_dir
+                .parent()
+                .map(|p| p.join("qwen3-tts-tokenizer"))
+                .unwrap_or_else(|| PathBuf::from("models/qwen3-tts-tokenizer"))
+        });
+
+        let device = Device::Cpu;
+
+        let pipeline = TtsPipeline::from_pretrained(model_dir, tokenizer_dir, &codec_dir, &device)?;
+
+        Ok(pipeline)
+    } else {
+        info!("Using mock pipeline (no --model-dir specified)");
+        Ok(TtsPipeline::new_mock()?)
+    }
+}
+
 /// Run the synthesis command.
-pub async fn run(
-    input: String,
-    output: PathBuf,
-    lang: String,
-    speaker: Option<u32>,
-    _model_config: Option<PathBuf>,
-    _seed: Option<u64>,
-) -> Result<()> {
+pub async fn run(options: SynthOptions) -> Result<()> {
     let start = Instant::now();
 
     // Parse language
-    let lang = match lang.to_lowercase().as_str() {
+    let lang = match options.lang.to_lowercase().as_str() {
         "ru" => Lang::Ru,
         "en" => Lang::En,
         "mixed" => Lang::Mixed,
-        _ => bail!("unknown language: {lang}, expected: ru, en, or mixed"),
+        _ => bail!(
+            "unknown language: {}, expected: ru, en, or mixed",
+            options.lang
+        ),
     };
 
     // Get input text
-    let text = if let Some(path) = input.strip_prefix('@') {
+    let text = if let Some(path) = options.input.strip_prefix('@') {
         info!(path = path, "Reading text from file");
         std::fs::read_to_string(path)?
     } else {
-        input
+        options.input.clone()
     };
 
     if text.trim().is_empty() {
@@ -44,13 +85,13 @@ pub async fn run(
     info!(
         text_len = text.len(),
         lang = %lang,
-        output = %output.display(),
-        speaker = ?speaker,
+        output = %options.output.display(),
+        speaker = ?options.speaker,
         "Starting synthesis"
     );
 
     // Create pipeline
-    let pipeline = TtsPipeline::new_mock()?;
+    let pipeline = create_pipeline(&options)?;
 
     // Synthesize
     let synth_start = Instant::now();
@@ -75,7 +116,7 @@ pub async fn run(
     };
 
     // Write to WAV file
-    write_wav(&output, &audio)?;
+    write_wav(&options.output, &audio)?;
 
     let total_duration = start.elapsed();
 
@@ -84,7 +125,7 @@ pub async fn run(
     println!();
     println!("Input:     {} chars", text.len());
     println!("Language:  {}", lang);
-    println!("Output:    {}", output.display());
+    println!("Output:    {}", options.output.display());
     println!();
     println!("Audio:");
     println!("  Duration:    {:.2} sec", audio_duration_sec);
@@ -103,7 +144,7 @@ pub async fn run(
     }
 
     info!(
-        output = %output.display(),
+        output = %options.output.display(),
         duration_ms = audio.duration_ms(),
         rtf = rtf,
         "Synthesis saved to file"
@@ -113,29 +154,22 @@ pub async fn run(
 }
 
 /// Run streaming synthesis command.
-pub async fn run_streaming(
-    input: String,
-    output: PathBuf,
-    lang: String,
-    _speaker: Option<u32>,
-    _model_config: Option<PathBuf>,
-    _seed: Option<u64>,
-) -> Result<()> {
+pub async fn run_streaming(options: SynthOptions) -> Result<()> {
     let start = Instant::now();
 
     // Parse language
-    let lang = match lang.to_lowercase().as_str() {
+    let lang = match options.lang.to_lowercase().as_str() {
         "ru" => Lang::Ru,
         "en" => Lang::En,
         "mixed" => Lang::Mixed,
-        _ => bail!("unknown language: {lang}"),
+        _ => bail!("unknown language: {}", options.lang),
     };
 
     // Get input text
-    let text = if let Some(path) = input.strip_prefix('@') {
+    let text = if let Some(path) = options.input.strip_prefix('@') {
         std::fs::read_to_string(path)?
     } else {
-        input
+        options.input.clone()
     };
 
     if text.trim().is_empty() {
@@ -144,12 +178,12 @@ pub async fn run_streaming(
 
     info!(
         text_len = text.len(),
-        output = %output.display(),
+        output = %options.output.display(),
         "Starting streaming synthesis"
     );
 
     // Create pipeline and streaming session
-    let pipeline = TtsPipeline::new_mock()?;
+    let pipeline = create_pipeline(&options)?;
     let mut session = pipeline.streaming_session()?;
 
     session.set_text(&text, Some(lang))?;
@@ -176,7 +210,7 @@ pub async fn run_streaming(
 
     // Write combined audio to WAV
     let audio = tts_core::AudioChunk::new(all_samples, 24000, 0.0, 0.0);
-    write_wav(&output, &audio)?;
+    write_wav(&options.output, &audio)?;
 
     let total_duration = start.elapsed();
 
@@ -184,7 +218,7 @@ pub async fn run_streaming(
     println!("  Chunks:      {}", chunk_count);
     println!("  Samples:     {}", audio.num_samples());
     println!("  Total time:  {:.1} ms", total_duration.as_millis());
-    println!("  Output:      {}", output.display());
+    println!("  Output:      {}", options.output.display());
 
     Ok(())
 }
@@ -194,20 +228,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn make_options(input: &str, output: PathBuf, lang: &str) -> SynthOptions {
+        SynthOptions {
+            input: input.to_string(),
+            output,
+            lang: lang.to_string(),
+            speaker: None,
+            model_dir: None,
+            codec_dir: None,
+            model_config: None,
+            seed: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_synth_basic() {
         let dir = tempdir().unwrap();
         let output = dir.path().join("test.wav");
 
-        let result = run(
-            "Hello world".to_string(),
-            output.clone(),
-            "en".to_string(),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let options = make_options("Hello world", output.clone(), "en");
+        let result = run(options).await;
 
         assert!(result.is_ok());
         assert!(output.exists());
@@ -218,15 +258,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join("test_ru.wav");
 
-        let result = run(
-            "Привет мир".to_string(),
-            output.clone(),
-            "ru".to_string(),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let options = make_options("Привет мир", output.clone(), "ru");
+        let result = run(options).await;
 
         assert!(result.is_ok());
         assert!(output.exists());
@@ -237,7 +270,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join("test.wav");
 
-        let result = run("".to_string(), output, "en".to_string(), None, None, None).await;
+        let options = make_options("", output, "en");
+        let result = run(options).await;
 
         assert!(result.is_err());
     }
@@ -247,15 +281,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join("test.wav");
 
-        let result = run(
-            "Test".to_string(),
-            output,
-            "invalid".to_string(),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let options = make_options("Test", output, "invalid");
+        let result = run(options).await;
 
         assert!(result.is_err());
     }
@@ -265,15 +292,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join("stream.wav");
 
-        let result = run_streaming(
-            "Test streaming".to_string(),
-            output.clone(),
-            "en".to_string(),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let options = make_options("Test streaming", output.clone(), "en");
+        let result = run_streaming(options).await;
 
         assert!(result.is_ok());
         assert!(output.exists());

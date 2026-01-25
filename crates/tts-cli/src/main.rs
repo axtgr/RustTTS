@@ -49,7 +49,15 @@ enum Commands {
         #[arg(short, long)]
         speaker: Option<u32>,
 
-        /// Model configuration file
+        /// Path to pretrained model directory (e.g., models/qwen3-tts-0.6b)
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Path to audio codec directory (defaults to models/qwen3-tts-tokenizer)
+        #[arg(long)]
+        codec_dir: Option<PathBuf>,
+
+        /// Model configuration file (legacy)
         #[arg(short, long)]
         model_config: Option<PathBuf>,
 
@@ -120,16 +128,29 @@ async fn main() -> Result<()> {
             output,
             lang,
             speaker,
+            model_dir,
+            codec_dir,
             model_config,
             seed,
             streaming,
         } => {
+            let synth_options = commands::synth::SynthOptions {
+                input,
+                output,
+                lang,
+                speaker,
+                model_dir,
+                codec_dir,
+                model_config,
+                seed,
+            };
+
             if streaming {
-                commands::synth::run_streaming(input, output, lang, speaker, model_config, seed)
+                commands::synth::run_streaming(synth_options)
                     .await
                     .context("streaming synthesis failed")?;
             } else {
-                commands::synth::run(input, output, lang, speaker, model_config, seed)
+                commands::synth::run(synth_options)
                     .await
                     .context("synthesis failed")?;
             }
