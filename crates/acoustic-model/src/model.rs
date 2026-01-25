@@ -30,6 +30,31 @@ pub struct Model {
 }
 
 impl Model {
+    /// Load model from a pretrained directory.
+    ///
+    /// Expects the directory to contain:
+    /// - `config.json` - model configuration
+    /// - `model.safetensors` - model weights
+    #[instrument(skip_all, fields(path = %dir.as_ref().display()))]
+    pub fn from_pretrained(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        let dir = dir.as_ref();
+        info!("Loading model from pretrained directory: {}", dir.display());
+
+        // Load config
+        let config = AcousticModelConfig::from_pretrained(dir).map_err(candle_core::Error::msg)?;
+
+        // Load weights
+        let weights_path = dir.join("model.safetensors");
+        if !weights_path.exists() {
+            return Err(candle_core::Error::msg(format!(
+                "model.safetensors not found in {}",
+                dir.display()
+            )));
+        }
+
+        Self::load(&weights_path, config, device)
+    }
+
     /// Load model from safetensors file.
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn load(

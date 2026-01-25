@@ -1,6 +1,9 @@
 //! Acoustic model configuration.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Configuration for the acoustic model (Talker).
 ///
@@ -61,6 +64,103 @@ impl Default for AcousticModelConfig {
 }
 
 impl AcousticModelConfig {
+    /// Load configuration from a JSON file (HuggingFace config.json format).
+    pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config file: {e}"))?;
+        Self::from_json(&content)
+    }
+
+    /// Load configuration from a pretrained model directory.
+    ///
+    /// Looks for `config.json` in the directory.
+    pub fn from_pretrained(dir: impl AsRef<Path>) -> Result<Self, String> {
+        let config_path = dir.as_ref().join("config.json");
+        if !config_path.exists() {
+            return Err(format!(
+                "config.json not found in {}",
+                dir.as_ref().display()
+            ));
+        }
+        Self::from_json_file(&config_path)
+    }
+
+    /// Parse configuration from JSON string (HuggingFace config.json format).
+    ///
+    /// Maps HuggingFace field names to our config structure.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let v: Value =
+            serde_json::from_str(json).map_err(|e| format!("failed to parse JSON: {e}"))?;
+
+        // Helper to extract values with defaults
+        let get_usize = |key: &str, default: usize| -> usize {
+            v.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(default)
+        };
+
+        let get_f64 = |key: &str, default: f64| -> f64 {
+            v.get(key).and_then(|v| v.as_f64()).unwrap_or(default)
+        };
+
+        let get_u32 = |key: &str, default: u32| -> u32 {
+            v.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(default)
+        };
+
+        // Map HuggingFace field names to our config
+        // HuggingFace uses: hidden_size, num_hidden_layers, num_attention_heads, etc.
+        let hidden_size = get_usize("hidden_size", 1024);
+        let num_attention_heads = get_usize("num_attention_heads", 16);
+        let num_kv_heads = get_usize("num_key_value_heads", 8);
+        let num_layers = get_usize("num_hidden_layers", 28);
+        let intermediate_size = get_usize("intermediate_size", 3072);
+        let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
+
+        let text_vocab_size = get_usize("vocab_size", 151936);
+        let codec_vocab_size = get_usize("codec_vocab_size", 3072);
+        let num_code_groups = get_usize("num_code_groups", 16);
+        let codebook_size = get_usize("codebook_size", 2048);
+
+        let max_position_embeddings = get_usize("max_position_embeddings", 32768);
+        let rope_theta = get_f64("rope_theta", 1_000_000.0);
+        let rms_norm_eps = get_f64("rms_norm_eps", 1e-6);
+
+        // Special tokens
+        let tts_bos_token_id = get_u32("tts_bos_token_id", 151672);
+        let tts_eos_token_id = get_u32("tts_eos_token_id", 151673);
+        let tts_pad_token_id = get_u32("tts_pad_token_id", 151671);
+        let codec_bos_id = get_u32("codec_bos_id", 2149);
+        let codec_eos_id = get_u32("codec_eos_token_id", 2150);
+        let codec_pad_id = get_u32("codec_pad_id", 2148);
+
+        Ok(Self {
+            hidden_size,
+            num_attention_heads,
+            num_kv_heads,
+            num_layers,
+            intermediate_size,
+            head_dim,
+            text_vocab_size,
+            codec_vocab_size,
+            num_code_groups,
+            codebook_size,
+            max_position_embeddings,
+            rope_theta,
+            rms_norm_eps,
+            tts_bos_token_id,
+            tts_eos_token_id,
+            tts_pad_token_id,
+            codec_bos_id,
+            codec_eos_id,
+            codec_pad_id,
+        })
+    }
+
     /// Configuration for Qwen3-TTS-12Hz-0.6B-Base model.
     pub fn qwen3_tts_0_6b() -> Self {
         Self {
@@ -304,5 +404,73 @@ mod tests {
         assert_eq!(config.tts_eos_token_id, 151673);
         assert_eq!(config.codec_bos_id, 2149);
         assert_eq!(config.codec_eos_id, 2150);
+    }
+
+    #[test]
+    fn test_from_json() {
+        let json = r#"{
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 12,
+            "intermediate_size": 2048,
+            "vocab_size": 50000,
+            "codec_vocab_size": 1024,
+            "num_code_groups": 8,
+            "codebook_size": 512,
+            "max_position_embeddings": 4096,
+            "rope_theta": 100000.0,
+            "rms_norm_eps": 1e-5,
+            "tts_bos_token_id": 100,
+            "tts_eos_token_id": 101,
+            "tts_pad_token_id": 0,
+            "codec_bos_id": 10,
+            "codec_eos_token_id": 11,
+            "codec_pad_id": 0
+        }"#;
+
+        let config = AcousticModelConfig::from_json(json).unwrap();
+
+        assert_eq!(config.hidden_size, 512);
+        assert_eq!(config.num_attention_heads, 8);
+        assert_eq!(config.num_kv_heads, 4);
+        assert_eq!(config.num_layers, 12);
+        assert_eq!(config.intermediate_size, 2048);
+        assert_eq!(config.text_vocab_size, 50000);
+        assert_eq!(config.codec_vocab_size, 1024);
+        assert_eq!(config.num_code_groups, 8);
+        assert_eq!(config.codebook_size, 512);
+        assert_eq!(config.max_position_embeddings, 4096);
+        assert!((config.rope_theta - 100000.0).abs() < 1e-6);
+        assert!((config.rms_norm_eps - 1e-5).abs() < 1e-10);
+        assert_eq!(config.tts_bos_token_id, 100);
+        assert_eq!(config.tts_eos_token_id, 101);
+        assert_eq!(config.codec_bos_id, 10);
+        assert_eq!(config.codec_eos_id, 11);
+    }
+
+    #[test]
+    fn test_from_json_with_defaults() {
+        // Minimal JSON - should use defaults for missing fields
+        let json = r#"{
+            "hidden_size": 256,
+            "num_hidden_layers": 4
+        }"#;
+
+        let config = AcousticModelConfig::from_json(json).unwrap();
+
+        assert_eq!(config.hidden_size, 256);
+        assert_eq!(config.num_layers, 4);
+        // Check defaults
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.codec_vocab_size, 3072);
+        assert_eq!(config.tts_bos_token_id, 151672);
+    }
+
+    #[test]
+    fn test_from_json_invalid() {
+        let json = "not valid json";
+        let result = AcousticModelConfig::from_json(json);
+        assert!(result.is_err());
     }
 }
