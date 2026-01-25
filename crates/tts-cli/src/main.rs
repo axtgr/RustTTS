@@ -42,7 +42,7 @@ enum Commands {
         output: PathBuf,
 
         /// Language hint (ru, en, or mixed)
-        #[arg(short, long, default_value = "ru")]
+        #[arg(long, default_value = "ru")]
         lang: String,
 
         /// Speaker ID (if model supports multiple speakers)
@@ -56,6 +56,10 @@ enum Commands {
         /// Random seed for deterministic generation
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Use streaming mode
+        #[arg(long)]
+        streaming: bool,
     },
 
     /// Normalize text without synthesis (dry run)
@@ -64,7 +68,7 @@ enum Commands {
         input: String,
 
         /// Language hint (ru, en, or mixed)
-        #[arg(short, long, default_value = "ru")]
+        #[arg(long, default_value = "ru")]
         lang: String,
     },
 
@@ -118,10 +122,17 @@ async fn main() -> Result<()> {
             speaker,
             model_config,
             seed,
+            streaming,
         } => {
-            commands::synth::run(input, output, lang, speaker, model_config, seed)
-                .await
-                .context("synthesis failed")?;
+            if streaming {
+                commands::synth::run_streaming(input, output, lang, speaker, model_config, seed)
+                    .await
+                    .context("streaming synthesis failed")?;
+            } else {
+                commands::synth::run(input, output, lang, speaker, model_config, seed)
+                    .await
+                    .context("synthesis failed")?;
+            }
         }
         Commands::Normalize { input, lang } => {
             commands::normalize::run(&input, &lang).context("normalization failed")?;
