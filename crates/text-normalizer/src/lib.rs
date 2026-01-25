@@ -21,6 +21,7 @@
 //! assert_eq!(result.text, "сто рублей");
 //! ```
 
+pub mod num2words;
 mod rules;
 
 use tracing::instrument;

@@ -26,3 +26,4 @@ lazy_static = "1.5"
 
 [dev-dependencies]
 proptest.workspace = true
+tts-core.workspace = true
