@@ -344,12 +344,15 @@ impl TtsPipeline {
         max_tokens: usize,
     ) -> TtsResult<Vec<u32>> {
         // Mock: generate acoustic tokens based on input
+        // Tokens must be < 2048 (codebook size for Qwen3-TTS)
+        const CODEBOOK_SIZE: u32 = 2048;
+
         let num_tokens = (text_tokens.len() * 2).min(max_tokens);
         let acoustic_tokens: Vec<u32> = text_tokens
             .iter()
             .cycle()
             .take(num_tokens)
-            .map(|&t| (t * 7 + 13) % 65536)
+            .map(|&t| (t * 7 + 13) % CODEBOOK_SIZE)
             .collect();
 
         debug!(
