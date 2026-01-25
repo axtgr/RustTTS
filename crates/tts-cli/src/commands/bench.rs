@@ -51,7 +51,7 @@ pub async fn run(_model_config: &Path, iterations: usize, text: &str) -> Result<
     println!();
 
     // Benchmark mock codec decoding
-    let codec = audio_codec_12hz::Codec12Hz::new();
+    let codec = audio_codec_12hz::Codec12Hz::new_mock();
     let mock_tokens: Vec<u32> = (0..100).collect();
 
     let decode_times: Vec<f64> = (0..iterations)
