@@ -8,6 +8,7 @@ fn bench_sampling(c: &mut Criterion) {
         temperature: 1.0,
         top_k: 50,
         top_p: 0.9,
+        repetition_penalty: 1.0,
         seed: Some(42),
     };
 

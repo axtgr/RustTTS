@@ -227,83 +227,200 @@ impl CodePredictor {
         &self.device
     }
 
-    /// Predict all residual codebooks from hidden states and zeroth codebook.
+    /// Get embedding for a specific residual codebook.
     ///
-    /// This is the main entry point for multi-codebook prediction.
-    /// Takes the hidden states from Talker's last layer (before codec_head)
-    /// and predicts all 15 residual codebooks in parallel.
+    /// This is used during generation to get embeddings for predicted tokens
+    /// that will be summed together for the next step.
     ///
     /// # Arguments
-    /// * `hidden_states` - Hidden states from Talker [batch, seq_len, hidden_size]
-    /// * `zeroth_codes` - Tokens from the zeroth (semantic) codebook [batch, seq_len]
+    /// * `codebook_idx` - Index 0-14 for residual codebooks 1-15
+    /// * `token_ids` - Token IDs to embed [batch, seq_len]
+    ///
+    /// # Returns
+    /// Embeddings [batch, seq_len, hidden_size]
+    pub fn get_codec_embedding(&self, codebook_idx: usize, token_ids: &Tensor) -> Result<Tensor> {
+        if codebook_idx >= self.codec_embeddings.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "codebook_idx {} out of range (max {})",
+                codebook_idx,
+                self.codec_embeddings.len() - 1
+            )));
+        }
+        self.codec_embeddings[codebook_idx].forward(token_ids)
+    }
+
+    /// Get embeddings for all residual codebooks at once.
+    ///
+    /// Given tokens for all 15 residual codebooks, returns the sum of their embeddings.
+    /// This is used during generation: `inputs_embeds = sum(codec_embeddings[i](tokens[i]))`.
+    ///
+    /// # Arguments
+    /// * `residual_codes` - Tokens for codebooks 1-15, shape [batch, 15] or [batch, seq, 15]
+    ///
+    /// # Returns
+    /// Sum of all embeddings [batch, 1, hidden_size] or [batch, seq, hidden_size]
+    pub fn sum_residual_embeddings(&self, residual_codes: &Tensor) -> Result<Tensor> {
+        let dims = residual_codes.dims();
+        let num_residual = self.codec_embeddings.len(); // 15
+
+        match dims.len() {
+            // [batch, 15] - single position
+            2 => {
+                let (_batch, num_codes) = residual_codes.dims2()?;
+                if num_codes != num_residual {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Expected {} residual codes, got {}",
+                        num_residual, num_codes
+                    )));
+                }
+
+                let mut sum: Option<Tensor> = None;
+                for i in 0..num_residual {
+                    let codes_i = residual_codes.i((.., i))?.unsqueeze(1)?; // [batch, 1]
+                    let emb = self.codec_embeddings[i].forward(&codes_i)?; // [batch, 1, hidden]
+                    sum = Some(match sum {
+                        None => emb,
+                        Some(s) => (&s + &emb)?,
+                    });
+                }
+                sum.ok_or_else(|| candle_core::Error::Msg("No embeddings to sum".into()))
+            }
+            // [batch, seq, 15] - multiple positions
+            3 => {
+                let (_batch, _seq, num_codes) = residual_codes.dims3()?;
+                if num_codes != num_residual {
+                    return Err(candle_core::Error::Msg(format!(
+                        "Expected {} residual codes, got {}",
+                        num_residual, num_codes
+                    )));
+                }
+
+                let mut sum: Option<Tensor> = None;
+                for i in 0..num_residual {
+                    let codes_i = residual_codes.i((.., .., i))?; // [batch, seq]
+                    let emb = self.codec_embeddings[i].forward(&codes_i)?; // [batch, seq, hidden]
+                    sum = Some(match sum {
+                        None => emb,
+                        Some(s) => (&s + &emb)?,
+                    });
+                }
+                sum.ok_or_else(|| candle_core::Error::Msg("No embeddings to sum".into()))
+            }
+            _ => Err(candle_core::Error::Msg(format!(
+                "Expected 2D or 3D tensor, got {}D",
+                dims.len()
+            ))),
+        }
+    }
+
+    /// Predict all residual codebooks from hidden states and zeroth codebook.
+    ///
+    /// This implements the Python SDK's CodePredictor autoregressive generation:
+    /// 1. Prefill with [past_hidden, zeroth_embed] (2 tokens)
+    /// 2. Generate 14 more tokens autoregressively, each using the embedding
+    ///    of the previously predicted token
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Hidden states from Talker's LAST layer [batch, 1, hidden_size]
+    /// * `zeroth_codes` - Token from the zeroth (semantic) codebook [batch, 1]
+    /// * `zeroth_embed` - Embedding of zeroth codebook token [batch, 1, hidden_size]
     /// * `sampling_config` - Sampling configuration
     ///
     /// # Returns
-    /// All codebook tokens [batch, seq_len, num_code_groups]
+    /// All codebook tokens [batch, 1, num_code_groups]
     /// where index 0 is the input zeroth_codes
-    #[instrument(skip(self, hidden_states, zeroth_codes, sampling_config))]
+    #[instrument(skip(self, hidden_states, zeroth_codes, zeroth_embed, sampling_config))]
     pub fn predict_from_hidden(
         &self,
         hidden_states: &Tensor,
         zeroth_codes: &Tensor,
+        zeroth_embed: &Tensor,
         sampling_config: SamplingConfig,
     ) -> Result<Tensor> {
-        let (batch_size, seq_len, _) = hidden_states.dims3()?;
+        let (batch_size, _, _) = hidden_states.dims3()?;
 
-        // Initialize output tensor with zeroth codebook
+        // Initialize output with zeroth codebook
         let mut all_codes = vec![zeroth_codes.clone()];
 
-        // For each residual codebook, embed the previous codebook and combine with hidden states
-        let mut prev_codes = zeroth_codes.clone();
-        let mut combined_hidden = hidden_states.clone();
+        // ===== PREFILL STAGE =====
+        // Python SDK: inputs_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
+        // past_hidden = hidden_states from Talker's last layer
+        // last_id_hidden = embedding of zeroth codebook token
+        let prefill_embeds = Tensor::cat(&[hidden_states, zeroth_embed], 1)?; // [batch, 2, hidden]
+        debug!(
+            "CodePredictor prefill: embeds shape {:?}",
+            prefill_embeds.dims()
+        );
 
-        // Pass through transformer layers (if any)
+        // Pass through transformer layers with KV cache
+        let mut kv_caches: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+        let mut current_hidden = prefill_embeds;
+
         for (i, layer) in self.layers.iter().enumerate() {
-            let (new_hidden, _, _) = layer.forward(&combined_hidden, &self.rotary_emb, 0, None)?;
-            combined_hidden = new_hidden;
-            debug!("CodePredictor layer {} done", i);
+            let (new_hidden, k_cache, v_cache) =
+                layer.forward(&current_hidden, &self.rotary_emb, 0, None)?;
+            kv_caches[i] = Some((k_cache, v_cache));
+            current_hidden = new_hidden;
         }
 
         // Apply final norm
-        let normed_hidden = self.norm.forward(&combined_hidden)?;
+        let normed_hidden = self.norm.forward(&current_hidden)?;
 
-        // Predict each residual codebook
+        // Get the last token's hidden state (after zeroth embedding)
+        let last_hidden = normed_hidden.i((.., 1.., ..))?; // [batch, 1, hidden]
+
+        // Predict first residual codebook (codebook 1)
+        // Python: logits = self.lm_head[generation_steps](hidden_states)
+        // For prefill, generation_steps = inputs_embeds.shape[1] - 2 = 0
+        let logits = self.lm_heads[0].forward(&last_hidden)?; // [batch, 1, codebook_size]
+
         let mut sampler = Sampler::new(sampling_config);
+        let mut predicted_code = self.sample_from_logits(&logits, &mut sampler, batch_size)?;
+        all_codes.push(predicted_code.clone());
+        debug!(
+            "CodePredictor: codebook 1 = {:?}",
+            predicted_code.to_vec2::<u32>()?
+        );
 
-        for (group_idx, (lm_head, codec_emb)) in self
-            .lm_heads
-            .iter()
-            .zip(self.codec_embeddings.iter())
-            .enumerate()
-        {
-            // Get logits for this codebook
-            let logits = lm_head.forward(&normed_hidden)?; // [batch, seq_len, codebook_size]
+        // ===== GENERATION STAGE =====
+        // Generate codebooks 2-15 autoregressively
+        let mut position_offset = 2; // We've processed 2 tokens in prefill
 
-            // Sample tokens for each position
-            let mut group_codes = Vec::with_capacity(batch_size * seq_len);
+        for gen_step in 1..15 {
+            // Python: inputs_embeds = self.model.get_input_embeddings()[generation_steps - 1](input_ids)
+            // generation_steps = gen_step, so we use codec_embedding[gen_step - 1]
+            let input_embed = self.codec_embeddings[gen_step - 1].forward(&predicted_code)?; // [batch, 1, hidden]
 
-            for b in 0..batch_size {
-                for s in 0..seq_len {
-                    let pos_logits = logits.i((b, s, ..))?;
-                    let logits_vec: Vec<f32> = pos_logits.to_vec1()?;
-                    let token = sampler.sample(&logits_vec);
-                    group_codes.push(token);
-                }
+            // Pass through transformer layers with KV cache
+            let mut current_hidden = input_embed;
+
+            for (i, layer) in self.layers.iter().enumerate() {
+                let kv_ref = kv_caches[i].as_ref().map(|(k, v)| (k, v));
+                let (new_hidden, k_cache, v_cache) =
+                    layer.forward(&current_hidden, &self.rotary_emb, position_offset, kv_ref)?;
+                kv_caches[i] = Some((k_cache, v_cache));
+                current_hidden = new_hidden;
             }
 
-            let group_tensor = Tensor::new(group_codes.as_slice(), &self.device)?
-                .reshape((batch_size, seq_len))?;
-            all_codes.push(group_tensor.clone());
+            // Apply final norm
+            let normed_hidden = self.norm.forward(&current_hidden)?;
 
-            debug!("Predicted codebook group {}", group_idx + 1);
+            // Predict next codebook
+            // Python: logits = self.lm_head[generation_steps](hidden_states)
+            let logits = self.lm_heads[gen_step].forward(&normed_hidden)?;
 
-            // Update hidden states with embedding of predicted codes for next group
-            // This creates the autoregressive dependency between codebooks
-            let _ = (prev_codes, codec_emb); // Mark as used - full impl would use these
-            prev_codes = group_tensor;
+            predicted_code = self.sample_from_logits(&logits, &mut sampler, batch_size)?;
+            all_codes.push(predicted_code.clone());
+            debug!(
+                "CodePredictor: codebook {} = {:?}",
+                gen_step + 1,
+                predicted_code.to_vec2::<u32>()?
+            );
+
+            position_offset += 1;
         }
 
-        // Stack all codebooks: [batch, seq_len, num_groups]
+        // Stack all codebooks: [batch, 1, num_groups]
         let stacked: Vec<Tensor> = all_codes
             .iter()
             .map(|t| t.unsqueeze(2))
@@ -312,56 +429,28 @@ impl CodePredictor {
         Tensor::cat(&stacked, 2)
     }
 
-    /// Predict all residual codebooks from zeroth codebook only.
-    ///
-    /// This is a simplified version that doesn't use hidden states from Talker.
-    /// Used for testing and when Talker hidden states are not available.
-    ///
-    /// # Arguments
-    /// * `zeroth_codes` - Tokens from the zeroth (semantic) codebook [batch, seq_len]
-    /// * `sampling_config` - Sampling configuration
-    ///
-    /// # Returns
-    /// All codebook tokens [batch, seq_len, num_code_groups]
-    /// where index 0 is the input zeroth_codes
-    #[instrument(skip(self, zeroth_codes, sampling_config))]
-    pub fn predict(
+    /// Sample tokens from logits.
+    fn sample_from_logits(
         &self,
-        zeroth_codes: &Tensor,
-        sampling_config: SamplingConfig,
+        logits: &Tensor,
+        sampler: &mut Sampler,
+        batch_size: usize,
     ) -> Result<Tensor> {
-        let (batch_size, seq_len) = zeroth_codes.dims2()?;
+        let mut codes = Vec::with_capacity(batch_size);
 
-        // Create zero hidden states for simplified prediction
-        let hidden_states = Tensor::zeros(
-            (batch_size, seq_len, self.config.hidden_size),
-            DType::F32,
-            &self.device,
-        )?;
+        for b in 0..batch_size {
+            let pos_logits = logits.i((b, 0, ..))?;
+            let logits_vec: Vec<f32> = pos_logits.to_vec1()?;
+            let token = sampler.sample(&logits_vec);
+            codes.push(token);
+        }
 
-        self.predict_from_hidden(&hidden_states, zeroth_codes, sampling_config)
+        Tensor::new(codes.as_slice(), &self.device)?.unsqueeze(1)
     }
 
-    /// Predict residual codebooks for a single frame (streaming mode).
-    ///
-    /// # Arguments
-    /// * `zeroth_code` - Single token from zeroth codebook
-    /// * `sampling_config` - Sampling configuration
-    ///
-    /// # Returns
-    /// All codebook tokens for this frame [num_groups]
-    pub fn predict_frame(
-        &self,
-        zeroth_code: u32,
-        sampling_config: SamplingConfig,
-    ) -> Result<Vec<u32>> {
-        let input = Tensor::new(&[zeroth_code], &self.device)?.unsqueeze(0)?;
-        let all_codes = self.predict(&input, sampling_config)?;
-
-        // Extract the single frame
-        let codes: Vec<u32> = all_codes.squeeze(0)?.squeeze(0)?.to_vec1()?;
-        Ok(codes)
-    }
+    // Note: The old `predict` and `predict_frame` methods have been removed.
+    // CodePredictor now requires proper hidden states and zeroth embeddings from Talker.
+    // Use `predict_from_hidden` with correct arguments instead.
 }
 
 /// Multi-codebook output container.
@@ -461,15 +550,19 @@ mod tests {
     }
 
     #[test]
-    fn test_code_predictor_predict_frame() {
+    fn test_code_predictor_get_codec_embedding() {
         let device = Device::Cpu;
         let config = test_config();
 
         let predictor = CodePredictor::new_random(config.clone(), &device).unwrap();
-        let sampling = SamplingConfig::greedy();
 
-        let frame = predictor.predict_frame(10, sampling).unwrap();
+        // Test getting embedding for codebook 0 (residual codebook 1)
+        let token_ids = Tensor::new(&[10u32], &device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap(); // [1, 1]
+        let emb = predictor.get_codec_embedding(0, &token_ids).unwrap();
 
-        assert_eq!(frame.len(), config.num_code_groups);
+        assert_eq!(emb.dims(), &[1, 1, config.hidden_size]);
     }
 }

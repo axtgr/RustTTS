@@ -6,9 +6,10 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder, embedding};
 use tracing::{debug, info, instrument, warn};
 
+use crate::code_predictor::CodePredictor;
 use crate::config::AcousticModelConfig;
 use crate::layers::{RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
-use crate::sampling::{Sampler, SamplingConfig};
+use crate::sampling::{Sampler, SamplingConfig, apply_repetition_penalty};
 
 /// KV cache type alias for transformer layers.
 pub type KvCache = Vec<(Tensor, Tensor)>;
@@ -272,267 +273,9 @@ impl Model {
         Ok((logits, new_kv_caches))
     }
 
-    /// Forward pass with explicit text and codec token handling.
-    ///
-    /// This is the proper forward pass for Qwen3-TTS that handles
-    /// mixed text/codec sequences correctly.
-    #[instrument(skip(self, text_ids, codec_ids, kv_caches))]
-    pub fn forward_mixed(
-        &self,
-        text_ids: Option<&Tensor>,
-        codec_ids: Option<&Tensor>,
-        position_offset: usize,
-        kv_caches: Option<&[(Tensor, Tensor)]>,
-    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        let (logits, _, new_kv_caches) =
-            self.forward_mixed_with_hidden(text_ids, codec_ids, position_offset, kv_caches)?;
-        Ok((logits, new_kv_caches))
-    }
-
-    /// Forward pass that also returns hidden states (before codec_head).
-    ///
-    /// This is needed for CodePredictor which uses the hidden states
-    /// to predict residual codebooks (1-15).
-    ///
-    /// # Returns
-    /// Tuple of (logits, hidden_states, kv_caches)
-    /// - logits: [batch, seq_len, codec_vocab_size]
-    /// - hidden_states: [batch, seq_len, hidden_size] - after final norm
-    /// - kv_caches: Updated KV caches for each layer
-    #[instrument(skip(self, text_ids, codec_ids, kv_caches))]
-    pub fn forward_mixed_with_hidden(
-        &self,
-        text_ids: Option<&Tensor>,
-        codec_ids: Option<&Tensor>,
-        position_offset: usize,
-        kv_caches: Option<&[(Tensor, Tensor)]>,
-    ) -> Result<ForwardWithHiddenOutput> {
-        // Embed tokens based on type
-        let hidden_states = match (text_ids, codec_ids) {
-            (Some(text), None) => self.embed_text(text)?,
-            (None, Some(codec)) => self.embed_codec(codec)?,
-            (Some(text), Some(codec)) => {
-                let text_hidden = self.embed_text(text)?;
-                let codec_hidden = self.embed_codec(codec)?;
-                Tensor::cat(&[text_hidden, codec_hidden], 1)?
-            }
-            (None, None) => {
-                return Err(candle_core::Error::Msg(
-                    "Must provide either text_ids or codec_ids".to_string(),
-                ));
-            }
-        };
-
-        let mut hidden_states = hidden_states;
-
-        // Pass through transformer layers
-        let mut new_kv_caches = Vec::with_capacity(self.layers.len());
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
-
-            let (new_hidden, k_cache, v_cache) =
-                layer.forward(&hidden_states, &self.rotary_emb, position_offset, kv_cache)?;
-
-            hidden_states = new_hidden;
-            new_kv_caches.push((k_cache, v_cache));
-        }
-
-        // Final norm
-        let hidden_states = self.norm.forward(&hidden_states)?;
-
-        // Project to codec vocabulary
-        let logits = self.codec_head.forward(&hidden_states)?;
-
-        Ok((logits, hidden_states, new_kv_caches))
-    }
-
-    /// Generate acoustic tokens autoregressively from text tokens.
-    ///
-    /// Uses forward_mixed to properly handle text prefill and codec generation.
-    /// Returns only the zeroth codebook tokens.
-    ///
-    /// # Arguments
-    /// - `text_ids`: Text tokens (including tts_bos, but NOT codec_bos)
-    /// - `codec_bos_id`: The codec BOS token ID to start generation
-    /// - `max_new_tokens`: Maximum number of tokens to generate
-    /// - `sampling_config`: Sampling configuration
-    /// - `eos_token_id`: EOS token ID to stop generation
-    #[instrument(skip(self, text_ids, sampling_config))]
-    pub fn generate(
-        &self,
-        text_ids: &[u32],
-        codec_bos_id: u32,
-        max_new_tokens: usize,
-        sampling_config: SamplingConfig,
-        eos_token_id: Option<u32>,
-    ) -> Result<Vec<u32>> {
-        let (tokens, _) = self.generate_with_hidden(
-            text_ids,
-            codec_bos_id,
-            max_new_tokens,
-            sampling_config,
-            eos_token_id,
-        )?;
-        Ok(tokens)
-    }
-
-    /// Generate acoustic tokens and return hidden states for CodePredictor.
-    ///
-    /// This method generates zeroth codebook tokens and also returns the
-    /// hidden states from each generation step, which can be used by
-    /// CodePredictor to predict residual codebooks (1-15).
-    ///
-    /// # Arguments
-    /// - `text_ids`: Text tokens (including tts_bos, but NOT codec_bos)
-    /// - `codec_bos_id`: The codec BOS token ID to start generation
-    /// - `max_new_tokens`: Maximum number of tokens to generate
-    /// - `sampling_config`: Sampling configuration
-    /// - `eos_token_id`: EOS token ID to stop generation
-    ///
-    /// # Returns
-    /// Tuple of (tokens, hidden_states)
-    /// - tokens: Vec<u32> - generated zeroth codebook tokens (NOT including codec_bos)
-    /// - hidden_states: Tensor [1, num_tokens, hidden_size] - concatenated hidden states
-    #[instrument(
-        skip(self, text_ids, sampling_config),
-        fields(max_new_tokens, eos_token_id)
-    )]
-    pub fn generate_with_hidden(
-        &self,
-        text_ids: &[u32],
-        codec_bos_id: u32,
-        max_new_tokens: usize,
-        sampling_config: SamplingConfig,
-        eos_token_id: Option<u32>,
-    ) -> Result<(Vec<u32>, Tensor)> {
-        info!(
-            "Generating up to {} tokens from {} text tokens + codec_bos={} (with hidden states)",
-            max_new_tokens,
-            text_ids.len(),
-            codec_bos_id
-        );
-
-        let mut sampler = Sampler::new(sampling_config);
-        let mut generated = Vec::with_capacity(max_new_tokens);
-        let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
-
-        // Suppress tokens: special tokens (2048-3071) except EOS
-        let suppress_start = 2048u32;
-        let suppress_end = self.config.codec_vocab_size as u32;
-
-        // Step 1: Prefill with text tokens only (using text_embedding)
-        let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, text_len]
-        let (_, _, text_kv_caches) =
-            self.forward_mixed_with_hidden(Some(&text_tensor), None, 0, None)?;
-
-        let mut position_offset = text_ids.len();
-
-        // Step 2: Forward codec_bos_id (using codec_embedding) to get first logits
-        let codec_bos_tensor = Tensor::new(&[codec_bos_id], &self.device)?.unsqueeze(0)?;
-        let (logits, hidden_states, new_kv_caches) = self.forward_mixed_with_hidden(
-            None,
-            Some(&codec_bos_tensor),
-            position_offset,
-            Some(&text_kv_caches),
-        )?;
-
-        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(new_kv_caches);
-        position_offset += 1;
-
-        // Sample first codec token from logits after codec_bos
-        let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-        let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
-
-        // Suppress special tokens (except EOS)
-        Self::suppress_special_tokens(&mut logits_vec, suppress_start, suppress_end, eos_token_id);
-
-        let mut current_token = sampler.sample(&logits_vec);
-
-        debug!("Step 0: sampled token {} after codec_bos", current_token);
-
-        // Check for EOS
-        if Some(current_token) == eos_token_id {
-            info!("EOS token generated at first step");
-            let empty_hidden =
-                Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?;
-            return Ok((generated, empty_hidden));
-        }
-        generated.push(current_token);
-
-        // Store hidden state for codec_bos position (needed for CodePredictor alignment)
-        all_hidden_states.push(hidden_states.clone());
-
-        // Generate remaining tokens
-        for step in 1..max_new_tokens {
-            // Create codec token tensor
-            let codec_tensor = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-
-            // Forward pass with codec token
-            let (logits, hidden_states, new_kv_caches) = self.forward_mixed_with_hidden(
-                None,
-                Some(&codec_tensor),
-                position_offset,
-                kv_caches.as_deref(),
-            )?;
-
-            // Store hidden state for this step
-            all_hidden_states.push(hidden_states.clone());
-
-            // Get logits for the last position
-            let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-            let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
-
-            // Suppress special tokens (except EOS)
-            Self::suppress_special_tokens(
-                &mut logits_vec,
-                suppress_start,
-                suppress_end,
-                eos_token_id,
-            );
-
-            // Sample next token
-            let next_token = sampler.sample(&logits_vec);
-
-            // Log every 50 steps or when close to EOS
-            if step % 50 == 0 || next_token >= 2048 {
-                info!(
-                    "Step {}: token={}, eos_token={:?}, is_eos={}",
-                    step,
-                    next_token,
-                    eos_token_id,
-                    Some(next_token) == eos_token_id
-                );
-            }
-            debug!("Step {}: generated token {}", step, next_token);
-
-            // Check for EOS
-            if Some(next_token) == eos_token_id {
-                info!("EOS token generated at step {}", step);
-                break;
-            }
-
-            generated.push(next_token);
-
-            // Update for next iteration
-            kv_caches = Some(new_kv_caches);
-            position_offset += 1;
-            current_token = next_token;
-        }
-
-        info!("Generated {} tokens", generated.len());
-
-        // Concatenate all hidden states: [1, num_tokens, hidden_size]
-        let concatenated_hidden = if all_hidden_states.is_empty() {
-            Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?
-        } else {
-            Tensor::cat(&all_hidden_states, 1)?
-        };
-
-        debug!("Hidden states shape: {:?}", concatenated_hidden.dims());
-
-        Ok((generated, concatenated_hidden))
-    }
+    // Note: generate() and generate_with_hidden() methods have been removed.
+    // Use generate_from_embeds() or generate_from_embeds_with_predictor() instead.
+    // These methods use the proper dual-track embedding format for Qwen3-TTS.
 
     /// Generate acoustic tokens from combined embeddings (Qwen3-TTS CustomVoice format).
     ///
@@ -563,9 +306,10 @@ impl Model {
         min_new_tokens: usize,
     ) -> Result<(Vec<u32>, Tensor)> {
         let seq_len = combined_embeds.dim(1)?;
+        let repetition_penalty = sampling_config.repetition_penalty;
         info!(
-            "Generating up to {} tokens (min={}) from {} prefill embeddings, tts_pad={}",
-            max_new_tokens, min_new_tokens, seq_len, tts_pad_token_id
+            "Generating up to {} tokens (min={}) from {} prefill embeddings, tts_pad={}, rep_penalty={}",
+            max_new_tokens, min_new_tokens, seq_len, tts_pad_token_id, repetition_penalty
         );
 
         let mut sampler = Sampler::new(sampling_config);
@@ -641,19 +385,10 @@ impl Model {
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
             let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
 
-            // Log top logits for early steps
-            if step <= 3 {
-                let mut indexed: Vec<(usize, f32)> =
-                    logits_vec.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
-                info!("Top 5 logits before suppress (step {}): {:?}", step, top_5);
-            }
-
-            // Suppress special tokens (except EOS)
+            // Suppress special tokens (except EOS when allowed)
             // Also suppress EOS if we haven't reached min_new_tokens yet
             let effective_eos = if generated.len() < min_new_tokens {
-                None // Don't allow EOS yet
+                None // Don't allow EOS yet - suppress all 2048+
             } else {
                 eos_token_id
             };
@@ -663,6 +398,21 @@ impl Model {
                 suppress_end,
                 effective_eos,
             );
+
+            // Apply repetition penalty to discourage repeated tokens
+            apply_repetition_penalty(&mut logits_vec, &generated, repetition_penalty);
+
+            // Log top logits for early steps (after suppression and repetition penalty)
+            if step <= 3 {
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+                info!(
+                    "Top 5 logits after suppress+rep_penalty (step {}): {:?}",
+                    step, top_5
+                );
+            }
 
             // Sample next token
             let next_token = sampler.sample(&logits_vec);
@@ -712,6 +462,298 @@ impl Model {
         };
 
         Ok((generated, concatenated_hidden))
+    }
+
+    /// Generate acoustic tokens from combined embeddings with CodePredictor integration.
+    ///
+    /// This method implements the correct Qwen3-TTS generation flow where each step
+    /// uses the **sum of all 16 codebook embeddings** from the previous step:
+    ///
+    /// ```text
+    /// Python SDK logic (modeling_qwen3_tts.py:1689-1692):
+    /// codec_hiddens = cat([zeroth_embed] + [code_predictor_embed[i](codes[i]) for i in 0..15])
+    /// inputs_embeds = codec_hiddens.sum(dim=1)
+    /// if generation_step < trailing_text_hidden.shape[1]:
+    ///     inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step]
+    /// else:
+    ///     inputs_embeds = inputs_embeds + tts_pad_embed
+    /// ```
+    ///
+    /// This is critical for generating tokens that match Python SDK output.
+    ///
+    /// # Arguments
+    /// - `combined_embeds`: Pre-computed embeddings [1, seq_len, hidden_size] = text_embed + codec_embed
+    /// - `tts_pad_token_id`: The TTS pad token ID to use after text_hidden is exhausted
+    /// - `code_predictor`: CodePredictor for predicting residual codebooks
+    /// - `max_new_tokens`: Maximum number of tokens to generate
+    /// - `sampling_config`: Sampling configuration
+    /// - `eos_token_id`: EOS token ID to stop generation
+    /// - `min_new_tokens`: Minimum tokens before EOS is allowed
+    /// - `trailing_text_hidden`: Optional text embeddings [1, num_text_tokens, hidden_size] for conditioning
+    ///   If provided, used for first N steps; after that tts_pad_embed is used.
+    ///
+    /// # Returns
+    /// Tuple of (zeroth_tokens, all_tokens_interleaved, hidden_states)
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        skip(
+            self,
+            combined_embeds,
+            code_predictor,
+            sampling_config,
+            trailing_text_hidden
+        ),
+        fields(max_new_tokens)
+    )]
+    pub fn generate_from_embeds_with_predictor(
+        &self,
+        combined_embeds: &Tensor,
+        tts_pad_token_id: u32,
+        code_predictor: &CodePredictor,
+        max_new_tokens: usize,
+        sampling_config: SamplingConfig,
+        eos_token_id: Option<u32>,
+        min_new_tokens: usize,
+        trailing_text_hidden: Option<&Tensor>,
+    ) -> Result<(Vec<u32>, Vec<Vec<u32>>, Tensor)> {
+        let seq_len = combined_embeds.dim(1)?;
+        let repetition_penalty = sampling_config.repetition_penalty;
+        info!(
+            "Generating up to {} tokens (min={}) from {} prefill embeddings with CodePredictor, tts_pad={}, rep_penalty={}",
+            max_new_tokens, min_new_tokens, seq_len, tts_pad_token_id, repetition_penalty
+        );
+
+        let mut sampler = Sampler::new(sampling_config.clone());
+        let mut generated_zeroth: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let mut all_frames: Vec<Vec<u32>> = Vec::with_capacity(max_new_tokens);
+        let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
+
+        // Suppress tokens: special tokens (2048-3071) except EOS
+        let suppress_start = 2048u32;
+        let suppress_end = self.config.codec_vocab_size as u32;
+
+        // Pre-compute tts_pad embedding
+        let tts_pad_tensor = Tensor::new(&[tts_pad_token_id], &self.device)?.unsqueeze(0)?;
+        let tts_pad_embed = self.embed_text(&tts_pad_tensor)?; // [1, 1, hidden_size]
+
+        // Get trailing_text length for conditioning
+        let trailing_text_len = trailing_text_hidden
+            .map(|t| t.dim(1).unwrap_or(0))
+            .unwrap_or(0);
+        info!(
+            "Trailing text hidden: {:?}, will use for first {} steps",
+            trailing_text_hidden.map(|t| t.dims().to_vec()),
+            trailing_text_len
+        );
+
+        // Step 1: Prefill with combined embeddings
+        let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
+
+        let mut position_offset = seq_len;
+        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(kv_caches);
+
+        // Sample first zeroth token from last position's logits
+        let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
+        let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+        // Log top logits before suppression
+        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+        info!("Top 5 logits before suppress (step 0): {:?}", top_5);
+
+        Self::suppress_special_tokens(&mut logits_vec, suppress_start, suppress_end, eos_token_id);
+
+        let mut current_zeroth_token = sampler.sample(&logits_vec);
+
+        debug!(
+            "Step 0: sampled zeroth token {} from prefill",
+            current_zeroth_token
+        );
+
+        // Check for EOS
+        if Some(current_zeroth_token) == eos_token_id {
+            info!("EOS token generated at first step");
+            let empty_hidden =
+                Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?;
+            return Ok((generated_zeroth, all_frames, empty_hidden));
+        }
+
+        generated_zeroth.push(current_zeroth_token);
+        all_hidden_states.push(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
+
+        // Predict residual codebooks for first token using CodePredictor
+        let first_hidden = hidden_states.i((.., seq_len - 1..seq_len, ..))?;
+        let zeroth_tensor = Tensor::new(&[current_zeroth_token], &self.device)?.unsqueeze(0)?;
+        let zeroth_embed = self.embed_codec(&zeroth_tensor)?; // [1, 1, hidden_size]
+        let first_residuals = code_predictor.predict_from_hidden(
+            &first_hidden,
+            &zeroth_tensor,
+            &zeroth_embed,
+            sampling_config.clone(),
+        )?;
+        // first_residuals shape: [1, 1, 16] - extract residuals (codebooks 1-15)
+        let first_residual_codes: Vec<u32> =
+            first_residuals.squeeze(0)?.squeeze(0)?.i(1..)?.to_vec1()?;
+
+        // Store first frame (all 16 codebooks)
+        let mut first_frame = vec![current_zeroth_token];
+        first_frame.extend(&first_residual_codes);
+        all_frames.push(first_frame);
+
+        info!(
+            "Step 0: zeroth={}, residuals={:?}",
+            current_zeroth_token,
+            &first_residual_codes[..3.min(first_residual_codes.len())]
+        );
+
+        // For next step, we need: sum of all 16 embeddings + tts_pad
+        // zeroth embedding comes from self.codec_embedding
+        // residual embeddings come from code_predictor.codec_embeddings[i]
+        let mut prev_residual_codes = first_residual_codes;
+
+        // Generate remaining tokens
+        for step in 1..max_new_tokens {
+            // Build combined embedding for this step:
+            // inputs_embeds = zeroth_embed + sum(residual_embeds[i]) + text_conditioning
+            // where text_conditioning = trailing_text_hidden[step] if step < len else tts_pad_embed
+
+            // 1. Zeroth codebook embedding (from main model)
+            let zeroth_tensor = Tensor::new(&[current_zeroth_token], &self.device)?.unsqueeze(0)?;
+            let zeroth_embed = self.embed_codec(&zeroth_tensor)?; // [1, 1, hidden]
+
+            // 2. Sum of residual embeddings (from CodePredictor)
+            let residual_tensor =
+                Tensor::new(prev_residual_codes.as_slice(), &self.device)?.unsqueeze(0)?;
+            let residual_sum = code_predictor.sum_residual_embeddings(&residual_tensor)?; // [1, 1, hidden]
+
+            // 3. Get text conditioning: trailing_text_hidden[generation_step] or tts_pad_embed
+            // Python: if generation_step < trailing_text_hidden.shape[1]:
+            //             inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step]
+            //         else:
+            //             inputs_embeds = inputs_embeds + tts_pad_embed
+            //
+            // Note: Python's generation_step is 0-indexed starting from the first generated token.
+            // Our `step` starts at 1 in the loop (after prefill generates token 0).
+            // So we need to use `step - 1` as the index into trailing_text_hidden.
+            let generation_step = step - 1; // 0-indexed generation step
+            let text_conditioning = if generation_step < trailing_text_len {
+                // Use trailing text hidden for this generation step
+                trailing_text_hidden
+                    .unwrap()
+                    .narrow(1, generation_step, 1)? // [1, 1, hidden]
+            } else {
+                // Text exhausted, use tts_pad
+                tts_pad_embed.clone()
+            };
+
+            // 4. Combine: zeroth + residual_sum + text_conditioning
+            let combined_step_embed = ((&zeroth_embed + &residual_sum)? + &text_conditioning)?;
+
+            // Forward pass
+            let (logits, hidden_states, new_kv_caches) =
+                self.forward_embeds(&combined_step_embed, position_offset, kv_caches.as_deref())?;
+
+            // Get logits for the last position
+            let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
+            let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+            // Suppress special tokens
+            let effective_eos = if generated_zeroth.len() < min_new_tokens {
+                None
+            } else {
+                eos_token_id
+            };
+            Self::suppress_special_tokens(
+                &mut logits_vec,
+                suppress_start,
+                suppress_end,
+                effective_eos,
+            );
+
+            // Apply repetition penalty
+            apply_repetition_penalty(&mut logits_vec, &generated_zeroth, repetition_penalty);
+
+            // Log top logits for early steps
+            if step <= 3 {
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+                info!(
+                    "Top 5 logits after suppress+rep_penalty (step {}): {:?}",
+                    step, top_5
+                );
+            }
+
+            // Sample next zeroth token
+            let next_zeroth = sampler.sample(&logits_vec);
+
+            // Log progress
+            if step % 50 == 0 || next_zeroth >= 2048 {
+                info!(
+                    "Step {}: zeroth={}, eos={:?}, is_eos={}, generated={}",
+                    step,
+                    next_zeroth,
+                    eos_token_id,
+                    Some(next_zeroth) == eos_token_id,
+                    generated_zeroth.len()
+                );
+            }
+            debug!("Step {}: generated zeroth token {}", step, next_zeroth);
+
+            // Check for EOS
+            if Some(next_zeroth) == eos_token_id && generated_zeroth.len() >= min_new_tokens {
+                info!(
+                    "EOS token generated at step {} (after {} tokens)",
+                    step,
+                    generated_zeroth.len()
+                );
+                break;
+            }
+
+            // Store hidden state
+            all_hidden_states.push(hidden_states.clone());
+
+            generated_zeroth.push(next_zeroth);
+
+            // Predict residual codebooks for this token
+            let zeroth_for_predictor = Tensor::new(&[next_zeroth], &self.device)?.unsqueeze(0)?;
+            let zeroth_embed_for_predictor = self.embed_codec(&zeroth_for_predictor)?; // [1, 1, hidden_size]
+            let residuals = code_predictor.predict_from_hidden(
+                &hidden_states,
+                &zeroth_for_predictor,
+                &zeroth_embed_for_predictor,
+                sampling_config.clone(),
+            )?;
+            let residual_codes: Vec<u32> = residuals.squeeze(0)?.squeeze(0)?.i(1..)?.to_vec1()?;
+
+            // Store frame
+            let mut frame = vec![next_zeroth];
+            frame.extend(&residual_codes);
+            all_frames.push(frame);
+
+            // Update for next iteration
+            kv_caches = Some(new_kv_caches);
+            position_offset += 1;
+            current_zeroth_token = next_zeroth;
+            prev_residual_codes = residual_codes;
+        }
+
+        info!(
+            "Generated {} zeroth tokens, {} frames",
+            generated_zeroth.len(),
+            all_frames.len()
+        );
+
+        // Concatenate hidden states
+        let concatenated_hidden = if all_hidden_states.is_empty() {
+            Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?
+        } else {
+            Tensor::cat(&all_hidden_states, 1)?
+        };
+
+        Ok((generated_zeroth, all_frames, concatenated_hidden))
     }
 
     /// Suppress special tokens in logits (set to -inf) except for EOS token.

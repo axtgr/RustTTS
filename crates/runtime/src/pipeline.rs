@@ -50,7 +50,7 @@ impl Default for PipelineConfig {
             default_lang: Lang::Ru,
             crossfade_ms: DEFAULT_CROSSFADE_MS,
             chunk_tokens: 10,
-            max_seq_len: 4096,
+            max_seq_len: 4096, // Max sequence length for audio generation
             default_speaker: None,
         }
     }
@@ -374,6 +374,10 @@ impl TtsPipeline {
     ///
     /// If CodePredictor is provided, generates all 16 codebooks and returns
     /// them in interleaved format. Otherwise, returns only zeroth codebook.
+    ///
+    /// This is a simplified version that uses basic prompt format.
+    /// For CustomVoice models with speaker/language support, use
+    /// `generate_acoustic_with_speaker` instead.
     fn generate_acoustic_neural(
         &self,
         model: &AcousticModel,
@@ -381,93 +385,127 @@ impl TtsPipeline {
         text_tokens: &[u32],
         max_tokens: usize,
     ) -> TtsResult<Vec<u32>> {
-        // Build text input sequence with special tokens:
-        // [tts_bos] [text_tokens...]
-        // Note: codec_bos is passed separately to generate_with_hidden
-        let mut text_input_ids = Vec::with_capacity(text_tokens.len() + 1);
-        text_input_ids.push(self.special_tokens.tts_bos_token_id);
-        text_input_ids.extend_from_slice(text_tokens);
+        use candle_core::Tensor;
+
+        let st = &self.special_tokens;
 
         debug!(
-            text_len = text_input_ids.len(),
-            codec_bos = self.special_tokens.codec_bos_id,
-            codec_eos = self.special_tokens.codec_eos_id,
+            text_len = text_tokens.len(),
+            codec_bos = st.codec_bos_id,
+            codec_eos = st.codec_eos_id,
             max_tokens = max_tokens,
             has_code_predictor = code_predictor.is_some(),
             "Starting neural acoustic generation"
         );
 
-        // Configure sampling
-        let sampling_config = SamplingConfig {
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 50,
-            seed: None,
-        };
+        // Build simple prompt format:
+        // Text track: [tts_bos, text_tokens..., tts_eos, tts_pad]
+        // Codec track: [codec_pad × (len(text)+2), codec_bos]
+        // Combined: text_embed + codec_embed at each position
 
-        // Generate zeroth codebook tokens with hidden states
-        // text_input_ids go through text_embedding, codec_bos goes through codec_embedding
-        let (zeroth_tokens, hidden_states) = model
-            .generate_with_hidden(
-                &text_input_ids,
-                self.special_tokens.codec_bos_id,
-                max_tokens,
-                sampling_config.clone(),
-                Some(self.special_tokens.codec_eos_id),
-            )
-            .map_err(|e| TtsError::inference(format!("acoustic generation failed: {e}")))?;
+        // Text track
+        let mut text_track: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        text_track.push(st.tts_bos_token_id);
+        text_track.extend_from_slice(text_tokens);
+        text_track.push(st.tts_eos_token_id);
+        text_track.push(st.tts_pad_token_id); // trigger position
 
-        debug!(
-            zeroth_tokens = zeroth_tokens.len(),
-            hidden_shape = ?hidden_states.dims(),
-            "Zeroth codebook generation complete"
-        );
+        // Codec track (all pad except last is bos)
+        let mut codec_track: Vec<u32> = vec![st.codec_pad_id; text_track.len() - 1];
+        codec_track.push(st.codec_bos_id); // trigger position
 
-        // If no CodePredictor, return only zeroth codebook
-        let Some(cp) = code_predictor else {
-            debug!("No CodePredictor, returning zeroth codebook only");
-            return Ok(zeroth_tokens);
-        };
-
-        // Use CodePredictor to generate residual codebooks (1-15)
-        if zeroth_tokens.is_empty() {
-            debug!("No tokens generated, returning empty");
-            return Ok(zeroth_tokens);
-        }
-
-        // Create tensor from zeroth codebook tokens
-        let zeroth_tensor = candle_core::Tensor::new(zeroth_tokens.as_slice(), &self.device)
+        // Create tensors
+        let text_tensor = Tensor::new(text_track.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        // Predict all codebooks using CodePredictor
-        let all_codes = cp
-            .predict_from_hidden(&hidden_states, &zeroth_tensor, sampling_config)
-            .map_err(|e| TtsError::inference(format!("code prediction failed: {e}")))?;
+        let codec_tensor = Tensor::new(codec_track.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        // Convert to interleaved format: [frame0_code0, frame0_code1, ..., frame1_code0, ...]
-        let (_, num_frames, num_groups) = all_codes
-            .dims3()
-            .map_err(|e| TtsError::inference(format!("dims3 failed: {e}")))?;
+        // Get embeddings
+        let text_embed = model
+            .get_text_embedding(&text_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        let all_codes_flat: Vec<u32> = all_codes
-            .squeeze(0)
-            .map_err(|e| TtsError::inference(format!("squeeze failed: {e}")))?
-            .to_vec2()
-            .map_err(|e| TtsError::inference(format!("to_vec2 failed: {e}")))?
-            .into_iter()
-            .flatten()
-            .collect();
+        let codec_embed = model
+            .get_codec_embedding(&codec_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        // Combine embeddings (sum as in Qwen3-TTS dual-track format)
+        let combined_embeds = (&text_embed + &codec_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
         debug!(
-            num_frames = num_frames,
-            num_groups = num_groups,
-            total_codes = all_codes_flat.len(),
-            "Multi-codebook generation complete"
+            text_track_len = text_track.len(),
+            codec_track_len = codec_track.len(),
+            combined_shape = ?combined_embeds.dims(),
+            "Combined embeddings built"
         );
 
-        Ok(all_codes_flat)
+        // Configure sampling - match Python SDK parameters
+        let sampling_config = SamplingConfig {
+            temperature: 0.9,
+            top_p: 1.0,
+            top_k: 50,
+            repetition_penalty: 1.05,
+            seed: None,
+        };
+
+        // Minimum tokens based on text length
+        let min_tokens = (text_tokens.len() * 5).max(20);
+
+        // Generate using embeddings
+        if let Some(cp) = code_predictor {
+            // With CodePredictor - generate all 16 codebooks
+            let (zeroth_tokens, all_frames, _hidden) = model
+                .generate_from_embeds_with_predictor(
+                    &combined_embeds,
+                    st.tts_pad_token_id,
+                    cp,
+                    max_tokens,
+                    sampling_config,
+                    Some(st.codec_eos_id),
+                    min_tokens,
+                    None, // No trailing text hidden in simple mode
+                )
+                .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+            debug!(
+                zeroth_tokens = zeroth_tokens.len(),
+                all_frames = all_frames.len(),
+                "Generation complete with CodePredictor"
+            );
+
+            if zeroth_tokens.is_empty() {
+                return Ok(zeroth_tokens);
+            }
+
+            // Flatten all frames to interleaved format
+            let all_codes_flat: Vec<u32> = all_frames.into_iter().flatten().collect();
+            return Ok(all_codes_flat);
+        }
+
+        // Without CodePredictor - generate zeroth codebook only
+        let (zeroth_tokens, _hidden) = model
+            .generate_from_embeds(
+                &combined_embeds,
+                st.tts_pad_token_id,
+                max_tokens,
+                sampling_config,
+                Some(st.codec_eos_id),
+                min_tokens,
+            )
+            .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+        debug!(
+            zeroth_tokens = zeroth_tokens.len(),
+            "Zeroth codebook generation complete"
+        );
+
+        Ok(zeroth_tokens)
     }
 
     /// Generate acoustic tokens with speaker for CustomVoice models.
@@ -511,81 +549,79 @@ impl TtsPipeline {
             text_tokens.len()
         );
 
-        // ========== PART 1: Role prefix with codec_pad ==========
-        // [im_start, assistant, newline] combined with [codec_pad, codec_pad, codec_pad]
+        // ========== Qwen3-TTS CustomVoice non_streaming_mode prompt format ==========
+        // From Python SDK analysis:
+        // 1. Role prefix: text_projection(im_start, assistant, \n) - NO codec embedding!
+        // 2. Codec prefix: (tts_pad × N + tts_bos) + codec[think, think_bos, lang, think_eos, speaker][:-1]
+        // 3. Text block: (text + tts_eos) + codec_pad × (len+1)
+        // 4. Trigger: tts_pad + codec_bos
+
+        // ========== PART 1: Role prefix - ONLY text_projection, no codec ==========
         let role_prefix: Vec<u32> = vec![
             st.im_start_token_id,  // 151644
             st.assistant_token_id, // 77091
             st.newline_token_id,   // 198
         ];
-        let role_codec: Vec<u32> = vec![st.codec_pad_id; role_prefix.len()];
 
         let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let role_codec_tensor = Tensor::new(role_codec.as_slice(), &self.device)
-            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
-
-        let role_text_embed = model
+        // Role is ONLY text_projection, no codec embedding added
+        let role_embed = model
             .get_text_embedding(&role_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        let role_codec_embed = model
-            .get_codec_embedding(&role_codec_tensor)
-            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
-
-        // Combine role: text_embed + codec_embed
-        let role_combined = (&role_text_embed + &role_codec_embed)
-            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
-
-        // ========== PART 2: Codec prefix with tts_pad ==========
-        // Build codec prefix: [think, think_bos, (lang_id), think_eos, (speaker_id)]
-        // Each paired with tts_pad on text side
-        let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
+        // ========== PART 2: Codec prefix with tts_pad/tts_bos ==========
+        // Build codec prefix: [think, think_bos, (lang_id), think_eos, (speaker_id), codec_pad, codec_bos]
+        // The last element (codec_bos) will be used in trigger, so we take [:-1] for this part
+        let mut codec_prefix_full: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
         if let Some(lid) = lang_id {
-            codec_prefix.push(lid);
+            codec_prefix_full.push(lid);
         }
-        codec_prefix.push(st.codec_think_eos_id);
+        codec_prefix_full.push(st.codec_think_eos_id);
         if let Some(sid) = speaker_id {
-            codec_prefix.push(sid);
+            codec_prefix_full.push(sid);
         }
+        // These two are for the trigger position, but we include codec_pad here
+        codec_prefix_full.push(st.codec_pad_id);
+        codec_prefix_full.push(st.codec_bos_id);
 
-        // Text side: all tts_pad
-        let text_for_codec_prefix: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len()];
+        // Split: codec_prefix[:-1] for this part
+        let codec_prefix: Vec<u32> = codec_prefix_full[..codec_prefix_full.len() - 1].to_vec();
+
+        // Text side for codec prefix: tts_pad × (N-1) + tts_bos
+        // Where N = len(codec_prefix)
+        let mut text_for_codec: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len() - 1];
+        text_for_codec.push(st.tts_bos_token_id);
 
         let codec_prefix_tensor = Tensor::new(codec_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let text_for_codec_prefix_tensor =
-            Tensor::new(text_for_codec_prefix.as_slice(), &self.device)
-                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-                .unsqueeze(0)
-                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+        let text_for_codec_tensor = Tensor::new(text_for_codec.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
         let codec_prefix_embed = model
             .get_codec_embedding(&codec_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
 
-        let text_for_codec_prefix_embed =
-            model
-                .get_text_embedding(&text_for_codec_prefix_tensor)
-                .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+        let text_for_codec_embed = model
+            .get_text_embedding(&text_for_codec_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        // Combine: tts_pad + codec_prefix (element-wise)
-        let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
+        // Combine: text_projection(tts_pad×N + tts_bos) + codec_embed(prefix[:-1])
+        let codec_prefix_combined = (&text_for_codec_embed + &codec_prefix_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
         // ========== PART 3: Text tokens with codec_pad ==========
-        // Build text sequence: [tts_bos, text_tokens..., tts_eos]
-        // Build codec sequence: [codec_pad, codec_pad..., codec_pad]
-        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 2);
-        text_seq.push(st.tts_bos_token_id);
+        // Text: [text_tokens..., tts_eos] (tts_bos is already in codec_prefix part)
+        // Codec: [codec_pad × (len+1)] - one extra for tts_eos
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 1);
         text_seq.extend_from_slice(text_tokens);
         text_seq.push(st.tts_eos_token_id);
 
@@ -615,7 +651,7 @@ impl TtsPipeline {
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
         // ========== PART 4: Generation trigger ==========
-        // Final position: [tts_pad] + [codec_bos] - this triggers audio generation
+        // Final position: tts_pad + codec_bos - this triggers audio generation
         let trigger_text = Tensor::new(&[st.tts_pad_token_id], &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
@@ -638,10 +674,10 @@ impl TtsPipeline {
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
         // ========== PART 5: Concatenate all parts ==========
-        // [role_combined] + [codec_prefix_combined] + [text_combined] + [trigger_combined]
+        // [role_embed] + [codec_prefix_combined] + [text_combined] + [trigger_combined]
         let combined_embeds = Tensor::cat(
             &[
-                role_combined,
+                role_embed,
                 codec_prefix_combined,
                 text_combined,
                 trigger_combined,
@@ -656,18 +692,20 @@ impl TtsPipeline {
             text_seq_len = text_seq.len(),
             trigger_len = 1,
             combined_shape = ?combined_embeds.dims(),
-            "Combined embeddings built"
+            "Combined embeddings built (non_streaming format)"
         );
 
-        // Configure sampling - use fixed seed for reproducibility during debugging
+        // Configure sampling - use greedy for debugging to compare with reference
+        // Python SDK: temperature=0.9, top_p=1.0, top_k=50, repetition_penalty=1.05
+        // TODO: Make this configurable, use temp=0 for greedy comparison
         let sampling_config = SamplingConfig {
-            temperature: 0.7,
-            top_p: 0.9,
+            temperature: 0.0, // Greedy for debugging
+            top_p: 1.0,
             top_k: 50,
-            seed: Some(42),
+            repetition_penalty: 1.0, // No penalty for greedy
+            seed: None,
         };
 
-        // Generate from combined embeddings with dual-track
         // min_new_tokens based on text length: ~5-10 audio tokens per text token
         let min_tokens = (text_tokens.len() * 5).max(20);
         info!(
@@ -675,7 +713,95 @@ impl TtsPipeline {
             min_tokens,
             text_tokens.len()
         );
-        let (zeroth_tokens, hidden_states) = model
+
+        // ========== COMPUTE trailing_text_hidden ==========
+        // Python SDK (modeling_qwen3_tts.py:2230-2232):
+        // trailing_text_hidden = torch.cat((self.talker.text_projection(
+        //     self.talker.get_text_embeddings()(input_id[:, 4:-5])
+        // ), tts_eos_embed), dim=1)
+        //
+        // This is: text_projection(text_tokens[1:]) concatenated with tts_eos_embed
+        // The first text token goes into prefill, remaining are for trailing conditioning
+        //
+        // For text "Hello world" with tokens [15339, 1917]:
+        // - text_tokens[0] = 15339 goes into prefill (combined with codec embeddings)
+        // - text_tokens[1:] = [1917] + tts_eos becomes trailing_text_hidden
+        //
+        // During generation step i:
+        // - if i < len(trailing_text_hidden): use trailing_text_hidden[i]
+        // - else: use tts_pad_embed
+        // trailing_text_hidden: text conditioning for generation steps
+        // Each step uses trailing_text_hidden[step] until exhausted, then uses tts_pad_embed
+        let trailing_text_hidden = if text_tokens.len() > 1 {
+            // Build trailing tokens: text_tokens[1:] + tts_eos
+            let mut trailing_tokens: Vec<u32> = text_tokens[1..].to_vec();
+            trailing_tokens.push(st.tts_eos_token_id);
+
+            let trailing_tensor = Tensor::new(trailing_tokens.as_slice(), &self.device)
+                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+            // Get text embeddings with projection
+            let trailing_embed = model
+                .get_text_embedding(&trailing_tensor)
+                .map_err(|e| TtsError::inference(format!("trailing text embed failed: {e}")))?;
+
+            info!(
+                "Built trailing_text_hidden from {} tokens (text[1:] + eos), shape: {:?}",
+                trailing_tokens.len(),
+                trailing_embed.dims()
+            );
+
+            Some(trailing_embed)
+        } else {
+            // Only one text token, no trailing hidden needed
+            info!("Single text token, no trailing_text_hidden");
+            None
+        };
+
+        // Use new method with CodePredictor if available
+        // This correctly sums all 16 codebook embeddings at each generation step
+        if let Some(cp) = code_predictor {
+            info!("Using generate_from_embeds_with_predictor (sum of all 16 codebook embeddings)");
+            let (zeroth_tokens, all_frames, _hidden_states) = model
+                .generate_from_embeds_with_predictor(
+                    &combined_embeds,
+                    st.tts_pad_token_id,
+                    cp,
+                    max_tokens,
+                    sampling_config.clone(),
+                    Some(st.codec_eos_id),
+                    min_tokens,
+                    trailing_text_hidden.as_ref(),
+                )
+                .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+            debug!(
+                zeroth_tokens = zeroth_tokens.len(),
+                all_frames = all_frames.len(),
+                "Generation complete with CodePredictor"
+            );
+
+            if zeroth_tokens.is_empty() {
+                return Ok(zeroth_tokens);
+            }
+
+            // Convert all_frames to interleaved format for codec decoder
+            // all_frames: Vec<Vec<u32>> where each inner Vec is [zeroth, r1, r2, ..., r15]
+            let all_codes_flat: Vec<u32> = all_frames.into_iter().flatten().collect();
+
+            debug!(
+                total_codes = all_codes_flat.len(),
+                "Multi-codebook generation complete (with predictor in loop)"
+            );
+
+            return Ok(all_codes_flat);
+        }
+
+        // Fallback: no CodePredictor - use old method
+        info!("Using generate_from_embeds (zeroth codebook only)");
+        let (zeroth_tokens, _hidden_states) = model
             .generate_from_embeds(
                 &combined_embeds,
                 st.tts_pad_token_id,
@@ -688,21 +814,9 @@ impl TtsPipeline {
 
         debug!(
             zeroth_tokens = zeroth_tokens.len(),
-            hidden_shape = ?hidden_states.dims(),
-            "Zeroth codebook generation complete"
+            "Zeroth codebook generation complete (no CodePredictor)"
         );
 
-        // If no CodePredictor, return only zeroth codebook
-        let Some(_cp) = code_predictor else {
-            return Ok(zeroth_tokens);
-        };
-
-        if zeroth_tokens.is_empty() {
-            return Ok(zeroth_tokens);
-        }
-
-        // Return zeroth codebook only for backward compatibility
-        // Use generate_acoustic_multi_codebook for full 16-codebook generation
         Ok(zeroth_tokens)
     }
 
@@ -733,73 +847,65 @@ impl TtsPipeline {
         };
         let lang_id = st.language_ids.by_name(lang_name);
 
-        // ========== PART 1: Role prefix with codec_pad ==========
+        // ========== Qwen3-TTS CustomVoice non_streaming_mode prompt format ==========
+        // (Same as generate_acoustic_with_speaker)
+
+        // ========== PART 1: Role prefix - ONLY text_projection, no codec ==========
         let role_prefix: Vec<u32> = vec![
             st.im_start_token_id,
             st.assistant_token_id,
             st.newline_token_id,
         ];
-        let role_codec: Vec<u32> = vec![st.codec_pad_id; role_prefix.len()];
 
         let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let role_codec_tensor = Tensor::new(role_codec.as_slice(), &self.device)
-            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
-
-        let role_text_embed = model
+        let role_embed = model
             .get_text_embedding(&role_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        let role_codec_embed = model
-            .get_codec_embedding(&role_codec_tensor)
-            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
-
-        let role_combined = (&role_text_embed + &role_codec_embed)
-            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
-
-        // ========== PART 2: Codec prefix with tts_pad ==========
-        let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
+        // ========== PART 2: Codec prefix with tts_pad/tts_bos ==========
+        let mut codec_prefix_full: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
         if let Some(lid) = lang_id {
-            codec_prefix.push(lid);
+            codec_prefix_full.push(lid);
         }
-        codec_prefix.push(st.codec_think_eos_id);
+        codec_prefix_full.push(st.codec_think_eos_id);
         if let Some(sid) = speaker_id {
-            codec_prefix.push(sid);
+            codec_prefix_full.push(sid);
         }
+        codec_prefix_full.push(st.codec_pad_id);
+        codec_prefix_full.push(st.codec_bos_id);
 
-        let text_for_codec_prefix: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len()];
+        let codec_prefix: Vec<u32> = codec_prefix_full[..codec_prefix_full.len() - 1].to_vec();
+
+        let mut text_for_codec: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len() - 1];
+        text_for_codec.push(st.tts_bos_token_id);
 
         let codec_prefix_tensor = Tensor::new(codec_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let text_for_codec_prefix_tensor =
-            Tensor::new(text_for_codec_prefix.as_slice(), &self.device)
-                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-                .unsqueeze(0)
-                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+        let text_for_codec_tensor = Tensor::new(text_for_codec.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
         let codec_prefix_embed = model
             .get_codec_embedding(&codec_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
 
-        let text_for_codec_prefix_embed =
-            model
-                .get_text_embedding(&text_for_codec_prefix_tensor)
-                .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+        let text_for_codec_embed = model
+            .get_text_embedding(&text_for_codec_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
+        let codec_prefix_combined = (&text_for_codec_embed + &codec_prefix_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
         // ========== PART 3: Text tokens with codec_pad ==========
-        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 2);
-        text_seq.push(st.tts_bos_token_id);
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 1);
         text_seq.extend_from_slice(text_tokens);
         text_seq.push(st.tts_eos_token_id);
 
@@ -851,7 +957,7 @@ impl TtsPipeline {
         // ========== PART 5: Concatenate all parts ==========
         let combined_embeds = Tensor::cat(
             &[
-                role_combined,
+                role_embed,
                 codec_prefix_combined,
                 text_combined,
                 trigger_combined,
@@ -864,40 +970,39 @@ impl TtsPipeline {
             temperature: 0.9,
             top_p: 1.0,
             top_k: 50,
+            repetition_penalty: 1.05,
             seed: None,
         };
 
-        // Generate zeroth codebook with dual-track
         // min_new_tokens based on text length
         let min_tokens = (text_tokens.len() * 5).max(20);
-        let (zeroth_tokens, hidden_states) = model
-            .generate_from_embeds(
-                &combined_embeds,
-                st.tts_pad_token_id,
-                max_tokens,
-                sampling_config.clone(),
-                Some(st.codec_eos_id),
-                min_tokens,
-            )
-            .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
 
-        // Filter special tokens from zeroth codebook
-        let zeroth_filtered: Vec<u32> = zeroth_tokens
-            .iter()
-            .filter(|&&t| t < 2048)
-            .copied()
-            .collect();
-
-        if zeroth_filtered.is_empty() {
-            return Err(TtsError::inference(
-                "no valid audio tokens generated".to_string(),
-            ));
-        }
-
-        let seq_len = zeroth_filtered.len();
-
-        // If no CodePredictor, return zeroth + zeros
+        // If no CodePredictor, generate only zeroth codebook
         let Some(cp) = code_predictor else {
+            let (zeroth_tokens, _hidden_states) = model
+                .generate_from_embeds(
+                    &combined_embeds,
+                    st.tts_pad_token_id,
+                    max_tokens,
+                    sampling_config.clone(),
+                    Some(st.codec_eos_id),
+                    min_tokens,
+                )
+                .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+            let zeroth_filtered: Vec<u32> = zeroth_tokens
+                .iter()
+                .filter(|&&t| t < 2048)
+                .copied()
+                .collect();
+
+            if zeroth_filtered.is_empty() {
+                return Err(TtsError::inference(
+                    "no valid audio tokens generated".to_string(),
+                ));
+            }
+
+            let seq_len = zeroth_filtered.len();
             let mut result = Vec::with_capacity(16);
             result.push(zeroth_filtered);
             for _ in 1..16 {
@@ -906,37 +1011,64 @@ impl TtsPipeline {
             return Ok(result);
         };
 
-        // Use CodePredictor to generate all codebooks
-        let zeroth_tensor = Tensor::new(zeroth_tokens.as_slice(), &self.device)
-            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+        // Use generate_from_embeds_with_predictor which correctly sums all 16 codebook embeddings
+        // at each generation step (matching Python SDK behavior)
+        info!("Using generate_from_embeds_with_predictor for multi-codebook generation");
 
-        info!(
-            "Running CodePredictor: hidden={:?}, zeroth={}",
-            hidden_states.dims(),
-            zeroth_tokens.len()
-        );
+        // Build trailing_text_hidden: text_tokens[1:] + tts_eos with text_projection
+        // During generation step i, use trailing_text_hidden[i] if available, else tts_pad_embed
+        let trailing_text_hidden = if text_tokens.len() > 1 {
+            let mut trailing_tokens: Vec<u32> = text_tokens[1..].to_vec();
+            trailing_tokens.push(st.tts_eos_token_id);
 
-        let all_codes = cp
-            .predict_from_hidden(&hidden_states, &zeroth_tensor, sampling_config)
-            .map_err(|e| TtsError::inference(format!("code prediction failed: {e}")))?;
+            let trailing_tensor = Tensor::new(trailing_tokens.as_slice(), &self.device)
+                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        // Convert from [1, seq_len, 16] to [16][seq_len]
-        // all_codes is [batch, seq_len, num_codebooks]
-        let all_codes_2d: Vec<Vec<u32>> = all_codes
-            .squeeze(0)
-            .map_err(|e| TtsError::inference(format!("squeeze failed: {e}")))?
-            .to_vec2()
-            .map_err(|e| TtsError::inference(format!("to_vec2 failed: {e}")))?;
+            let trailing_embed = model
+                .get_text_embedding(&trailing_tensor)
+                .map_err(|e| TtsError::inference(format!("trailing text embed failed: {e}")))?;
 
-        // Transpose: from [seq_len][16] to [16][seq_len]
+            info!(
+                "Built trailing_text_hidden from {} tokens (text[1:] + eos), shape: {:?}",
+                trailing_tokens.len(),
+                trailing_embed.dims()
+            );
+            Some(trailing_embed)
+        } else {
+            info!("Single text token, no trailing_text_hidden");
+            None
+        };
+
+        let (_zeroth_tokens, all_frames, _hidden_states) = model
+            .generate_from_embeds_with_predictor(
+                &combined_embeds,
+                st.tts_pad_token_id,
+                cp,
+                max_tokens,
+                sampling_config.clone(),
+                Some(st.codec_eos_id),
+                min_tokens,
+                trailing_text_hidden.as_ref(),
+            )
+            .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+        if all_frames.is_empty() {
+            return Err(TtsError::inference(
+                "no valid audio tokens generated".to_string(),
+            ));
+        }
+
+        // Convert all_frames from Vec<[zeroth, r1..r15]> to Vec<Vec<u32>> by codebook
+        // all_frames: Vec<Vec<u32>> where each inner Vec is [zeroth, r1, r2, ..., r15] (16 elements)
+        let seq_len = all_frames.len();
         let num_codebooks = 16;
         let mut result: Vec<Vec<u32>> = (0..num_codebooks)
             .map(|_| Vec::with_capacity(seq_len))
             .collect();
 
-        for frame in all_codes_2d.iter() {
+        for frame in all_frames.iter() {
             for (cb_idx, &token) in frame.iter().enumerate() {
                 if cb_idx < num_codebooks {
                     // Filter special tokens (>= 2048) for each codebook

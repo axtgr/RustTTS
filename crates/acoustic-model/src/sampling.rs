@@ -13,6 +13,8 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Top-p (nucleus) parameter (1.0 = disabled).
     pub top_p: f32,
+    /// Repetition penalty (1.0 = disabled, >1.0 = discourage repetition).
+    pub repetition_penalty: f32,
     /// Random seed (None = random).
     pub seed: Option<u64>,
 }
@@ -23,6 +25,7 @@ impl Default for SamplingConfig {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            repetition_penalty: 1.0,
             seed: None,
         }
     }
@@ -35,6 +38,7 @@ impl SamplingConfig {
             temperature: 0.0, // Will trigger argmax
             top_k: 1,
             top_p: 1.0,
+            repetition_penalty: 1.0,
             seed: Some(0),
         }
     }
@@ -71,6 +75,31 @@ pub struct Sampler {
     rng: StdRng,
 }
 
+/// Apply repetition penalty to logits for previously generated tokens.
+///
+/// Following HuggingFace transformers implementation:
+/// - If logit < 0: multiply by penalty (makes more negative)
+/// - If logit >= 0: divide by penalty (makes less positive)
+///
+/// This discourages the model from repeating tokens it has already generated.
+pub fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalty: f32) {
+    if (penalty - 1.0).abs() < f32::EPSILON {
+        // No penalty to apply
+        return;
+    }
+
+    for &token in generated_tokens {
+        let idx = token as usize;
+        if idx < logits.len() {
+            if logits[idx] < 0.0 {
+                logits[idx] *= penalty;
+            } else {
+                logits[idx] /= penalty;
+            }
+        }
+    }
+}
+
 impl Sampler {
     /// Create a new sampler with the given configuration.
     pub fn new(config: SamplingConfig) -> Self {
@@ -85,6 +114,11 @@ impl Sampler {
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         if logits.is_empty() {
             return 0;
+        }
+
+        // Greedy decoding: temperature=0 or very low means argmax
+        if self.config.temperature < f32::EPSILON {
+            return self.greedy(logits);
         }
 
         // Apply temperature
