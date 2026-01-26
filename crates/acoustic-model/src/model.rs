@@ -634,6 +634,7 @@ impl Model {
     ///
     /// # Returns
     /// Tuple of (logits, hidden_states, kv_caches)
+    #[allow(clippy::type_complexity)]
     fn forward_embeds(
         &self,
         hidden_states: &Tensor,

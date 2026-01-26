@@ -798,72 +798,84 @@ impl NeuralDecoder {
             })
             .map_err(|e| TtsError::internal(format!("failed to create input_conv: {e}")))?;
 
-        // Build upsampling stages - use random init as fallback
-        let mut upsample_blocks = Vec::new();
-        let mut channels = config.decoder_dim;
+        // Try to load HiFi-GAN blocks from Qwen3 format FIRST
+        // decoder.decoder.{1-4} are the upsample blocks with Snake activation
+        let (hifi_blocks, final_snake, use_hifi) = Self::try_load_hifi_gan(&vb, &config, device);
 
-        for (i, &factor) in config.upsample_rates.iter().enumerate() {
-            let out_channels = (channels / 2).max(32);
-            let kernel_size = factor * 2;
-            let block = UpsampleBlock::new(
-                channels,
-                out_channels,
-                factor,
-                kernel_size,
-                config.num_residual_blocks,
-                vb.pp(format!("upsample_{i}")),
-            )
-            .or_else(|_| {
-                debug!("Using random init for upsample_{}", i);
-                UpsampleBlock::new_random(
+        // Determine output channels based on whether HiFi-GAN was loaded
+        // HiFi-GAN outputs 96 channels, legacy outputs variable channels
+        let (upsample_blocks, output_channels) = if use_hifi {
+            // HiFi-GAN mode - output is 96 channels, don't need legacy blocks
+            (Vec::new(), 96usize)
+        } else {
+            // Legacy mode - build upsampling stages
+            let mut blocks = Vec::new();
+            let mut channels = config.decoder_dim;
+
+            for (i, &factor) in config.upsample_rates.iter().enumerate() {
+                let out_channels = (channels / 2).max(32);
+                let kernel_size = factor * 2;
+                let block = UpsampleBlock::new(
                     channels,
                     out_channels,
                     factor,
                     kernel_size,
                     config.num_residual_blocks,
-                    device,
+                    vb.pp(format!("upsample_{i}")),
                 )
-            })
-            .map_err(|e| TtsError::internal(format!("failed to create upsample_{i}: {e}")))?;
+                .or_else(|_| {
+                    debug!("Using random init for upsample_{}", i);
+                    UpsampleBlock::new_random(
+                        channels,
+                        out_channels,
+                        factor,
+                        kernel_size,
+                        config.num_residual_blocks,
+                        device,
+                    )
+                })
+                .map_err(|e| TtsError::internal(format!("failed to create upsample_{i}: {e}")))?;
 
-            upsample_blocks.push(block);
-            channels = out_channels;
-        }
+                blocks.push(block);
+                channels = out_channels;
+            }
 
-        // Additional upsampling for upsampling_ratios
-        for (i, &factor) in config.upsampling_ratios.iter().enumerate() {
-            let idx = config.upsample_rates.len() + i;
-            let out_channels = (channels / 2).max(32);
-            let kernel_size = factor * 2;
-            let block = UpsampleBlock::new(
-                channels,
-                out_channels,
-                factor,
-                kernel_size,
-                config.num_residual_blocks,
-                vb.pp(format!("upsample_{idx}")),
-            )
-            .or_else(|_| {
-                debug!("Using random init for upsample_{}", idx);
-                UpsampleBlock::new_random(
+            // Additional upsampling for upsampling_ratios
+            for (i, &factor) in config.upsampling_ratios.iter().enumerate() {
+                let idx = config.upsample_rates.len() + i;
+                let out_channels = (channels / 2).max(32);
+                let kernel_size = factor * 2;
+                let block = UpsampleBlock::new(
                     channels,
                     out_channels,
                     factor,
                     kernel_size,
                     config.num_residual_blocks,
-                    device,
+                    vb.pp(format!("upsample_{idx}")),
                 )
-            })
-            .map_err(|e| TtsError::internal(format!("failed to create upsample_{idx}: {e}")))?;
+                .or_else(|_| {
+                    debug!("Using random init for upsample_{}", idx);
+                    UpsampleBlock::new_random(
+                        channels,
+                        out_channels,
+                        factor,
+                        kernel_size,
+                        config.num_residual_blocks,
+                        device,
+                    )
+                })
+                .map_err(|e| TtsError::internal(format!("failed to create upsample_{idx}: {e}")))?;
 
-            upsample_blocks.push(block);
-            channels = out_channels;
-        }
+                blocks.push(block);
+                channels = out_channels;
+            }
+            (blocks, channels)
+        };
 
-        // Try Qwen3 format for output conv, then fallback to our format, then random
+        // Load output conv with correct number of input channels
         let output_conv = vb
             .pp("decoder.decoder.6")
-            .get((1, channels, 7), "conv.weight")
+            .get((1, output_channels, 7), "conv.weight")
             .and_then(|w| {
                 let b = vb.pp("decoder.decoder.6").get((1,), "conv.bias")?;
                 Ok((w, b))
@@ -880,7 +892,7 @@ impl NeuralDecoder {
             })
             .or_else(|_| {
                 conv1d(
-                    channels,
+                    output_channels,
                     1,
                     7,
                     Conv1dConfig {
@@ -892,13 +904,9 @@ impl NeuralDecoder {
             })
             .or_else(|_| {
                 debug!("Using random init for output_conv");
-                create_random_conv1d(channels, 1, 7, device)
+                create_random_conv1d(output_channels, 1, 7, device)
             })
             .map_err(|e| TtsError::internal(format!("failed to create output_conv: {e}")))?;
-
-        // Try to load HiFi-GAN blocks from Qwen3 format
-        // decoder.decoder.{1-4} are the upsample blocks with Snake activation
-        let (hifi_blocks, final_snake, use_hifi) = Self::try_load_hifi_gan(&vb, &config, device);
 
         if use_hifi {
             info!(
