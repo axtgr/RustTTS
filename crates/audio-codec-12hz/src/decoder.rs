@@ -407,9 +407,12 @@ impl UpsampleBlock {
 /// 1. RVQ dequantize: lookup embeddings from 16 codebooks
 /// 2. Output projection: project each embedding 256→512 and sum
 /// 3. Pre-conv: Conv1d [1024, 512, 3]
-/// 4. Pre-Transformer: 8-layer causal transformer
-/// 5. HiFi-GAN: 4 upsample blocks with Snake activation
-/// 6. Output: Conv1d to mono audio
+/// 4. Pre-Transformer: 8-layer causal transformer with final norm
+/// 5. ConvNeXt Upsample: 2 blocks, each 2x upsample (total 4x)
+/// 6. HiFi-GAN: 4 upsample blocks with Snake activation (total 480x)
+/// 7. Output: Conv1d to mono audio
+///
+/// Total upsampling: 4 (ConvNeXt) × 480 (HiFi-GAN) = 1920x
 #[derive(Debug)]
 pub struct NeuralDecoder {
     /// Codebook embeddings (one per quantizer) [2048, 256].
@@ -420,8 +423,10 @@ pub struct NeuralDecoder {
     rvq_rest_output_proj: Option<RvqOutputProj>,
     /// Pre-conv: [1024, 512, 3] projects sum to 1024-dim.
     pre_conv: Option<Conv1d>,
-    /// Pre-Transformer: 8-layer transformer.
+    /// Pre-Transformer: 8-layer transformer with final norm.
     pre_transformer: Option<PreTransformer>,
+    /// ConvNeXt upsample blocks (2 blocks, each 2x = 4x total).
+    convnext_upsample: Option<Vec<ConvNeXtUpsampleBlock>>,
     /// HiFi-GAN initial conv [1536, 1024, 7].
     input_conv: Conv1d,
     /// Upsampling stages (legacy mode).
@@ -546,6 +551,7 @@ impl NeuralDecoder {
             rvq_rest_output_proj: None,
             pre_conv: None,
             pre_transformer: None,
+            convnext_upsample: None,
             embed_proj: Some(embed_proj.unwrap_or_else(|| {
                 // Fallback - create identity-like projection
                 let w = Tensor::zeros(
@@ -800,9 +806,17 @@ impl NeuralDecoder {
         let pre_transformer =
             PreTransformer::from_vb(vb.pp("decoder.pre_transformer"), &config, device).ok();
 
-        let use_full_qwen3 = pre_conv.is_some() && pre_transformer.is_some() && has_rvq_proj;
+        // Try to load ConvNeXt upsample blocks (decoder.upsample.{0,1})
+        let convnext_upsample = Self::try_load_convnext_upsample(&vb, device);
+        let has_convnext = convnext_upsample.is_some();
+        if has_convnext {
+            debug!("Loaded ConvNeXt upsample blocks (4x upsampling)");
+        }
+
+        let use_full_qwen3 =
+            pre_conv.is_some() && pre_transformer.is_some() && has_rvq_proj && has_convnext;
         if use_full_qwen3 {
-            info!("Using full Qwen3-TTS decoder architecture");
+            info!("Using full Qwen3-TTS decoder architecture with ConvNeXt upsample");
         } else {
             debug!("Pre-transformer not fully loaded, will use legacy mode");
         }
@@ -992,6 +1006,7 @@ impl NeuralDecoder {
             rvq_rest_output_proj,
             pre_conv,
             pre_transformer,
+            convnext_upsample,
             embed_proj,
             input_conv,
             upsample_blocks,
@@ -1003,6 +1018,40 @@ impl NeuralDecoder {
             use_full_qwen3,
             use_hifi,
         })
+    }
+
+    /// Try to load ConvNeXt upsample blocks from Qwen3-TTS weights.
+    ///
+    /// These blocks provide 4x upsampling (2 blocks, each 2x) between
+    /// pre_transformer and HiFi-GAN decoder.
+    fn try_load_convnext_upsample(
+        vb: &VarBuilder,
+        _device: &Device,
+    ) -> Option<Vec<ConvNeXtUpsampleBlock>> {
+        // decoder.upsample.{0,1} - two ConvNeXt upsample blocks
+        // Each block: ConvTranspose1d (2x) + ConvNeXtBlock
+        // Total: 2x * 2x = 4x upsampling
+
+        let mut blocks = Vec::with_capacity(2);
+
+        for i in 0..2 {
+            match ConvNeXtUpsampleBlock::from_vb(vb.pp(format!("decoder.upsample.{}", i)), 1024) {
+                Ok(block) => {
+                    blocks.push(block);
+                    debug!("Loaded ConvNeXt upsample block {}", i);
+                }
+                Err(e) => {
+                    debug!("Failed to load ConvNeXt upsample block {}: {}", i, e);
+                    return None;
+                }
+            }
+        }
+
+        info!(
+            "Loaded {} ConvNeXt upsample blocks (4x total upsampling)",
+            blocks.len()
+        );
+        Some(blocks)
     }
 
     /// Try to load HiFi-GAN components from Qwen3-TTS weights.
@@ -1243,8 +1292,9 @@ impl NeuralDecoder {
     /// 2. Output projection: project each embedding 256→512 via Conv1d
     /// 3. Residual sum: sum all 16 projected embeddings
     /// 4. Pre-conv: Conv1d [1024, 512, 3]
-    /// 5. Pre-Transformer: 8-layer causal transformer
-    /// 6. HiFi-GAN: 4 upsample blocks → audio
+    /// 5. Pre-Transformer: 8-layer causal transformer with final norm
+    /// 6. ConvNeXt Upsample: 2 blocks, each 2x (total 4x upsampling)
+    /// 7. HiFi-GAN: 4 upsample blocks with Snake activation → audio
     fn decode_qwen3_internal(&self, tokens: &[Vec<u32>]) -> CandleResult<Vec<f32>> {
         let seq_len = tokens[0].len();
         debug!(
@@ -1268,6 +1318,10 @@ impl NeuralDecoder {
             .pre_transformer
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("pre_transformer not loaded".to_string()))?;
+        let convnext_upsample = self
+            .convnext_upsample
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("convnext_upsample not loaded".to_string()))?;
 
         // Step 1 & 2: RVQ dequantize with output projection for each codebook
         // Then sum all projected embeddings (residual sum)
@@ -1306,11 +1360,18 @@ impl NeuralDecoder {
         let x = pre_conv.forward(&x)?;
         debug!("After pre_conv: {:?}", x.dims());
 
-        // Step 4: Pre-Transformer
+        // Step 4: Pre-Transformer (includes final norm)
         let x = pre_transformer.forward(&x)?;
         debug!("After pre_transformer: {:?}", x.dims());
 
-        // Step 5: HiFi-GAN decoder
+        // Step 5: ConvNeXt upsample (4x total)
+        let mut x = x;
+        for (i, block) in convnext_upsample.iter().enumerate() {
+            x = block.forward(&x)?;
+            debug!("After ConvNeXt upsample block {}: {:?}", i, x.dims());
+        }
+
+        // Step 6: HiFi-GAN decoder
         let mut x = self.input_conv.forward(&x)?;
         debug!("After input_conv: {:?}", x.dims());
 
@@ -1699,12 +1760,14 @@ impl PreTransformerLayer {
 /// Pre-Transformer module.
 ///
 /// This is the transformer that processes the quantizer output before HiFi-GAN.
-/// Structure: input_proj -> layers -> output_proj
+/// Structure: input_proj -> layers -> norm -> output_proj
 #[derive(Debug)]
 struct PreTransformer {
     input_proj: Tensor,
     input_proj_bias: Tensor,
     layers: Vec<PreTransformerLayer>,
+    /// Final RmsNorm before output projection.
+    norm: Option<RmsNorm>,
     output_proj: Tensor,
     output_proj_bias: Tensor,
 }
@@ -1735,16 +1798,31 @@ impl PreTransformer {
             }
         }
 
+        // Final norm: [512] - RmsNorm before output projection
+        let norm = RmsNorm::from_vb(vb.pp("norm"), 512, config.rms_norm_eps).ok();
+        if norm.is_some() {
+            debug!("Loaded pre_transformer final norm");
+        }
+
         // output_proj: [1024, 512] - projects from 512 back to 1024
         let output_proj = vb.get((1024, 512), "output_proj.weight")?;
         let output_proj_bias = vb.get((1024,), "output_proj.bias")?;
 
-        info!("Loaded PreTransformer with {} layers", layers.len());
+        info!(
+            "Loaded PreTransformer with {} layers{}",
+            layers.len(),
+            if norm.is_some() {
+                " and final norm"
+            } else {
+                ""
+            }
+        );
 
         Ok(Self {
             input_proj,
             input_proj_bias,
             layers,
+            norm,
             output_proj,
             output_proj_bias,
         })
@@ -1767,6 +1845,11 @@ impl PreTransformer {
         // Transformer layers
         for layer in &self.layers {
             x = layer.forward(&x)?;
+        }
+
+        // Final norm before output projection
+        if let Some(ref norm) = self.norm {
+            x = norm.forward(&x)?;
         }
 
         // Output projection: [batch, seq_len, 512] -> [batch, seq_len, 1024]
@@ -1814,6 +1897,240 @@ impl RvqOutputProj {
         let out_flat = x_flat.matmul(&weight.t()?)?; // [batch*seq_len, 512]
         let out = out_flat.reshape((batch, seq_len, 512))?; // [batch, seq_len, 512]
         out.transpose(1, 2) // [batch, 512, seq_len]
+    }
+}
+
+// =============================================================================
+// ConvNeXt Upsample Components (decoder.upsample.{0,1})
+// =============================================================================
+
+/// LayerNorm for ConvNeXt blocks.
+///
+/// Operates on the channel dimension (last dimension after permute).
+#[derive(Debug)]
+struct ConvNextLayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl ConvNextLayerNorm {
+    fn from_vb(vb: VarBuilder, channels: usize) -> CandleResult<Self> {
+        let weight = vb.get((channels,), "weight")?;
+        let bias = vb.get((channels,), "bias")?;
+        Ok(Self {
+            weight,
+            bias,
+            eps: 1e-6,
+        })
+    }
+
+    /// Forward pass for input shape [batch, channels, seq_len].
+    ///
+    /// Normalizes across the channel dimension.
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, channels, seq_len]
+        // Transpose to [batch, seq_len, channels] for layer norm
+        let x = x.transpose(1, 2)?;
+
+        // Compute mean and variance across channels
+        let mean = x.mean_keepdim(2)?;
+        let x_centered = x.broadcast_sub(&mean)?;
+        let variance = x_centered.sqr()?.mean_keepdim(2)?;
+        let normalized = x_centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+
+        // Apply weight and bias
+        let weight = self.weight.unsqueeze(0)?.unsqueeze(0)?;
+        let bias = self.bias.unsqueeze(0)?.unsqueeze(0)?;
+        let out = normalized.broadcast_mul(&weight)?.broadcast_add(&bias)?;
+
+        // Transpose back to [batch, channels, seq_len]
+        out.transpose(1, 2)
+    }
+}
+
+/// ConvNeXt block used in the upsample path.
+///
+/// Structure (from decoder.upsample.{0,1}.1):
+/// - dwconv: Depthwise conv [channels, 1, 7]
+/// - norm: LayerNorm [channels]
+/// - pwconv1: Pointwise conv (expansion) [4*channels, channels]
+/// - GELU activation
+/// - pwconv2: Pointwise conv (projection) [channels, 4*channels]
+/// - gamma: Residual scale [channels]
+/// - Residual connection
+#[derive(Debug)]
+struct ConvNeXtBlock {
+    dwconv_weight: Tensor,
+    dwconv_bias: Tensor,
+    norm: ConvNextLayerNorm,
+    pwconv1_weight: Tensor,
+    pwconv1_bias: Tensor,
+    pwconv2_weight: Tensor,
+    pwconv2_bias: Tensor,
+    gamma: Tensor,
+    channels: usize,
+}
+
+impl ConvNeXtBlock {
+    fn from_vb(vb: VarBuilder, channels: usize) -> CandleResult<Self> {
+        // Depthwise conv: [channels, 1, 7] - groups=channels
+        let dwconv_weight = vb.get((channels, 1, 7), "dwconv.conv.weight")?;
+        let dwconv_bias = vb.get((channels,), "dwconv.conv.bias")?;
+
+        // LayerNorm
+        let norm = ConvNextLayerNorm::from_vb(vb.pp("norm"), channels)?;
+
+        // Pointwise convs (implemented as Linear)
+        let intermediate = channels * 4; // 1024 * 4 = 4096
+        let pwconv1_weight = vb.get((intermediate, channels), "pwconv1.weight")?;
+        let pwconv1_bias = vb.get((intermediate,), "pwconv1.bias")?;
+        let pwconv2_weight = vb.get((channels, intermediate), "pwconv2.weight")?;
+        let pwconv2_bias = vb.get((channels,), "pwconv2.bias")?;
+
+        // Gamma for residual scaling
+        let gamma = vb.get((channels,), "gamma")?;
+
+        Ok(Self {
+            dwconv_weight,
+            dwconv_bias,
+            norm,
+            pwconv1_weight,
+            pwconv1_bias,
+            pwconv2_weight,
+            pwconv2_bias,
+            gamma,
+            channels,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let residual = x.clone();
+        // x: [batch, channels, seq_len]
+
+        // Depthwise conv with groups=channels
+        let x = self.depthwise_conv(x)?;
+
+        // LayerNorm (operates on channel dim)
+        let x = self.norm.forward(&x)?;
+
+        // Transpose for pointwise convs: [batch, channels, seq_len] -> [batch, seq_len, channels]
+        let x = x.transpose(1, 2)?;
+        let (batch, seq_len, _) = x.dims3()?;
+
+        // Pointwise conv1 (expansion)
+        let x_flat = x.reshape((batch * seq_len, self.channels))?;
+        let x = x_flat.matmul(&self.pwconv1_weight.t()?)?;
+        let bias = self.pwconv1_bias.unsqueeze(0)?;
+        let x = x.broadcast_add(&bias)?;
+
+        // GELU activation
+        let x = x.gelu_erf()?;
+
+        // Pointwise conv2 (projection)
+        let x = x.matmul(&self.pwconv2_weight.t()?)?;
+        let bias = self.pwconv2_bias.unsqueeze(0)?;
+        let x = x.broadcast_add(&bias)?;
+
+        // Reshape back: [batch * seq_len, channels] -> [batch, seq_len, channels]
+        let x = x.reshape((batch, seq_len, self.channels))?;
+
+        // Transpose back: [batch, seq_len, channels] -> [batch, channels, seq_len]
+        let x = x.transpose(1, 2)?;
+
+        // Apply gamma scaling
+        let gamma = self.gamma.unsqueeze(0)?.unsqueeze(2)?; // [1, channels, 1]
+        let x = x.broadcast_mul(&gamma)?;
+
+        // Residual connection
+        x + residual
+    }
+
+    /// Depthwise convolution (groups = channels).
+    fn depthwise_conv(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, channels, seq_len]
+        // weight: [channels, 1, 7] - one filter per channel
+        // For depthwise conv, we need to apply each filter to its corresponding channel
+
+        let (_batch, channels, _seq_len) = x.dims3()?;
+        let kernel_size = 7;
+        let padding = kernel_size / 2;
+
+        // Pad the input
+        let x_padded = x.pad_with_zeros(2, padding, padding)?;
+
+        // Manual depthwise convolution
+        let mut output_slices = Vec::with_capacity(channels);
+
+        for c in 0..channels {
+            // Extract single channel: [batch, 1, seq_len + 2*padding]
+            let x_c = x_padded.narrow(1, c, 1)?;
+
+            // Get filter for this channel: [1, 1, kernel_size]
+            let w_c = self.dwconv_weight.narrow(0, c, 1)?;
+
+            // Apply convolution using candle's conv1d
+            let cfg = Conv1dConfig {
+                padding: 0,
+                ..Default::default()
+            };
+            let conv = Conv1d::new(w_c, None, cfg);
+            let out_c = conv.forward(&x_c)?;
+
+            output_slices.push(out_c);
+        }
+
+        // Concatenate along channel dimension
+        let output = Tensor::cat(&output_slices, 1)?;
+
+        // Add bias: [channels] -> [1, channels, 1]
+        let bias = self.dwconv_bias.unsqueeze(0)?.unsqueeze(2)?;
+        output.broadcast_add(&bias)
+    }
+}
+
+/// ConvNeXt Upsample Block.
+///
+/// Structure (from decoder.upsample.{0,1}):
+/// - ConvTranspose1d for 2x upsampling (*.0.conv)
+/// - ConvNeXtBlock (*.1)
+#[derive(Debug)]
+struct ConvNeXtUpsampleBlock {
+    upsample_conv: ConvTranspose1d,
+    convnext: ConvNeXtBlock,
+}
+
+impl ConvNeXtUpsampleBlock {
+    fn from_vb(vb: VarBuilder, channels: usize) -> CandleResult<Self> {
+        // ConvTranspose1d: [channels, channels, 2] stride=2 for 2x upsample
+        let upsample_weight = vb.get((channels, channels, 2), "0.conv.weight")?;
+        let upsample_bias = vb.get((channels,), "0.conv.bias")?;
+
+        let cfg = ConvTranspose1dConfig {
+            stride: 2,
+            padding: 0,
+            output_padding: 0,
+            ..Default::default()
+        };
+        let upsample_conv = ConvTranspose1d::new(upsample_weight, Some(upsample_bias), cfg);
+
+        // ConvNeXt block
+        let convnext = ConvNeXtBlock::from_vb(vb.pp("1"), channels)?;
+
+        Ok(Self {
+            upsample_conv,
+            convnext,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, channels, seq_len]
+
+        // 2x upsample via ConvTranspose1d
+        let x = self.upsample_conv.forward(x)?;
+
+        // ConvNeXt block
+        self.convnext.forward(&x)
     }
 }
 
