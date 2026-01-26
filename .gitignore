@@ -50,3 +50,6 @@ config/server.toml
 # Temporary files
 *.tmp
 *.bak
+.python-version
+.venv*/
+__pycache__/

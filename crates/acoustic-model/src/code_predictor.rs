@@ -346,6 +346,13 @@ impl CodePredictor {
         // Python SDK: inputs_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
         // past_hidden = hidden_states from Talker's last layer
         // last_id_hidden = embedding of zeroth codebook token
+
+        // Debug: print first 20 values of hidden_states for comparison with Python
+        let hs_values: Vec<f32> = hidden_states.i((0, 0, ..20))?.to_vec1()?;
+        info!("CodePredictor past_hidden first 20: {:?}", hs_values);
+        let ze_values: Vec<f32> = zeroth_embed.i((0, 0, ..20))?.to_vec1()?;
+        info!("CodePredictor zeroth_embed first 20: {:?}", ze_values);
+
         let prefill_embeds = Tensor::cat(&[hidden_states, zeroth_embed], 1)?; // [batch, 2, hidden]
         debug!(
             "CodePredictor prefill: embeds shape {:?}",

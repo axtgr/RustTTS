@@ -549,6 +549,13 @@ impl Model {
         // Step 1: Prefill with combined embeddings
         let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
 
+        // Debug: print hidden_states at last position after prefill
+        let hs_last: Vec<f32> = hidden_states.i((0, seq_len - 1, ..20))?.to_vec1()?;
+        info!(
+            "Talker hidden_states (last pos, first 20 after norm): {:?}",
+            hs_last
+        );
+
         let mut position_offset = seq_len;
         let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(kv_caches);
 
@@ -788,6 +795,16 @@ impl Model {
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut hidden_states = hidden_states.clone();
         let mut new_kv_caches = Vec::with_capacity(self.layers.len());
+        let seq_len = hidden_states.dim(1)?;
+
+        // Debug: log input embeddings (only for prefill)
+        if position_offset == 0 && seq_len > 1 {
+            let input_first20: Vec<f32> = hidden_states.i((0, seq_len - 1, ..20))?.to_vec1()?;
+            debug!(
+                "forward_embeds input (last pos, first 20): {:?}",
+                input_first20
+            );
+        }
 
         for (i, layer) in self.layers.iter().enumerate() {
             let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
@@ -797,6 +814,15 @@ impl Model {
 
             hidden_states = new_hidden;
             new_kv_caches.push((k_cache, v_cache));
+
+            // Debug: log after first few layers (only for prefill, to reduce noise)
+            if position_offset == 0 && seq_len > 1 && (i < 5 || i >= self.layers.len() - 3) {
+                let layer_first20: Vec<f32> = hidden_states.i((0, seq_len - 1, ..20))?.to_vec1()?;
+                debug!(
+                    "forward_embeds after layer {}, last pos, first 20: {:?}",
+                    i, layer_first20
+                );
+            }
         }
 
         // Final norm

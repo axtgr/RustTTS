@@ -1,0 +1,19 @@
+{
+  "text": "Hello world",
+  "input_ids": [
+    [
+      151644,
+      77091,
+      198,
+      9707,
+      1879,
+      151645,
+      198,
+      151644,
+      77091,
+      198
+    ]
+  ],
+  "code_predictor_inputs": [],
+  "past_hidden_values": []
+}
