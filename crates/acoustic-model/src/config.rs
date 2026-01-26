@@ -12,6 +12,9 @@ use serde_json::Value;
 pub struct AcousticModelConfig {
     /// Hidden dimension size.
     pub hidden_size: usize,
+    /// Text embedding dimension (before projection).
+    /// In Qwen3-TTS this is 2048, which gets projected to hidden_size (1024).
+    pub embedding_dim: usize,
     /// Number of attention heads.
     pub num_attention_heads: usize,
     /// Number of key-value heads (for GQA).
@@ -89,40 +92,56 @@ impl AcousticModelConfig {
     /// Parse configuration from JSON string (HuggingFace config.json format).
     ///
     /// Maps HuggingFace field names to our config structure.
+    /// Supports both flat configs and Qwen3-TTS nested configs (with talker_config).
     pub fn from_json(json: &str) -> Result<Self, String> {
         let v: Value =
             serde_json::from_str(json).map_err(|e| format!("failed to parse JSON: {e}"))?;
 
-        // Helper to extract values with defaults
+        // Check if this is a nested Qwen3-TTS config with talker_config
+        let talker = v.get("talker_config");
+
+        // Helper to extract values with defaults, checking talker_config first
         let get_usize = |key: &str, default: usize| -> usize {
-            v.get(key)
+            // First try talker_config, then root
+            talker
+                .and_then(|t| t.get(key))
+                .or_else(|| v.get(key))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(default)
         };
 
         let get_f64 = |key: &str, default: f64| -> f64 {
-            v.get(key).and_then(|v| v.as_f64()).unwrap_or(default)
+            talker
+                .and_then(|t| t.get(key))
+                .or_else(|| v.get(key))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(default)
         };
 
         let get_u32 = |key: &str, default: u32| -> u32 {
-            v.get(key)
+            talker
+                .and_then(|t| t.get(key))
+                .or_else(|| v.get(key))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32)
                 .unwrap_or(default)
         };
 
         // Map HuggingFace field names to our config
-        // HuggingFace uses: hidden_size, num_hidden_layers, num_attention_heads, etc.
+        // Qwen3-TTS uses: talker_config.hidden_size, talker_config.num_hidden_layers, etc.
         let hidden_size = get_usize("hidden_size", 1024);
+        // Qwen3-TTS uses text_hidden_size=2048 which gets projected to hidden_size=1024
+        let embedding_dim = get_usize("text_hidden_size", 2048);
         let num_attention_heads = get_usize("num_attention_heads", 16);
         let num_kv_heads = get_usize("num_key_value_heads", 8);
         let num_layers = get_usize("num_hidden_layers", 28);
         let intermediate_size = get_usize("intermediate_size", 3072);
         let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
 
-        let text_vocab_size = get_usize("vocab_size", 151936);
-        let codec_vocab_size = get_usize("codec_vocab_size", 3072);
+        // Vocabulary sizes - use text_vocab_size for text, vocab_size for codec
+        let text_vocab_size = get_usize("text_vocab_size", 151936);
+        let codec_vocab_size = get_usize("vocab_size", 3072);
         let num_code_groups = get_usize("num_code_groups", 16);
         let codebook_size = get_usize("codebook_size", 2048);
 
@@ -130,16 +149,29 @@ impl AcousticModelConfig {
         let rope_theta = get_f64("rope_theta", 1_000_000.0);
         let rms_norm_eps = get_f64("rms_norm_eps", 1e-6);
 
-        // Special tokens
-        let tts_bos_token_id = get_u32("tts_bos_token_id", 151672);
-        let tts_eos_token_id = get_u32("tts_eos_token_id", 151673);
-        let tts_pad_token_id = get_u32("tts_pad_token_id", 151671);
+        // Special tokens - from root level in Qwen3-TTS
+        let tts_bos_token_id = v
+            .get("tts_bos_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(151672);
+        let tts_eos_token_id = v
+            .get("tts_eos_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(151673);
+        let tts_pad_token_id = v
+            .get("tts_pad_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(151671);
         let codec_bos_id = get_u32("codec_bos_id", 2149);
         let codec_eos_id = get_u32("codec_eos_token_id", 2150);
         let codec_pad_id = get_u32("codec_pad_id", 2148);
 
         Ok(Self {
             hidden_size,
+            embedding_dim,
             num_attention_heads,
             num_kv_heads,
             num_layers,
@@ -166,11 +198,12 @@ impl AcousticModelConfig {
         Self {
             // Talker dimensions
             hidden_size: 1024,
+            embedding_dim: 2048, // text_embedding is [vocab_size, 2048]
             num_attention_heads: 16,
             num_kv_heads: 8,
             num_layers: 28,
             intermediate_size: 3072,
-            head_dim: 128, // 1024 / 8 per spec, but config says 128
+            head_dim: 128, // num_heads * head_dim = 16 * 128 = 2048 for Q
 
             // Vocabulary
             text_vocab_size: 151936,
@@ -198,6 +231,7 @@ impl AcousticModelConfig {
         Self {
             // Talker dimensions (estimated, needs verification)
             hidden_size: 2048,
+            embedding_dim: 4096, // estimated
             num_attention_heads: 16,
             num_kv_heads: 8,
             num_layers: 28,
@@ -229,6 +263,7 @@ impl AcousticModelConfig {
     pub fn tiny() -> Self {
         Self {
             hidden_size: 64,
+            embedding_dim: 64, // same as hidden_size for testing
             num_attention_heads: 4,
             num_kv_heads: 2,
             num_layers: 2,
@@ -261,6 +296,7 @@ impl AcousticModelConfig {
     pub fn legacy() -> Self {
         Self {
             hidden_size: 2048,
+            embedding_dim: 2048,
             num_attention_heads: 16,
             num_kv_heads: 4,
             num_layers: 24,
@@ -408,30 +444,35 @@ mod tests {
 
     #[test]
     fn test_from_json() {
+        // Test with Qwen3-TTS style config (nested talker_config)
         let json = r#"{
-            "hidden_size": 512,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 4,
-            "num_hidden_layers": 12,
-            "intermediate_size": 2048,
-            "vocab_size": 50000,
-            "codec_vocab_size": 1024,
-            "num_code_groups": 8,
-            "codebook_size": 512,
-            "max_position_embeddings": 4096,
-            "rope_theta": 100000.0,
-            "rms_norm_eps": 1e-5,
             "tts_bos_token_id": 100,
             "tts_eos_token_id": 101,
             "tts_pad_token_id": 0,
-            "codec_bos_id": 10,
-            "codec_eos_token_id": 11,
-            "codec_pad_id": 0
+            "talker_config": {
+                "hidden_size": 512,
+                "text_hidden_size": 1024,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "num_hidden_layers": 12,
+                "intermediate_size": 2048,
+                "text_vocab_size": 50000,
+                "vocab_size": 1024,
+                "num_code_groups": 8,
+                "codebook_size": 512,
+                "max_position_embeddings": 4096,
+                "rope_theta": 100000.0,
+                "rms_norm_eps": 1e-5,
+                "codec_bos_id": 10,
+                "codec_eos_token_id": 11,
+                "codec_pad_id": 0
+            }
         }"#;
 
         let config = AcousticModelConfig::from_json(json).unwrap();
 
         assert_eq!(config.hidden_size, 512);
+        assert_eq!(config.embedding_dim, 1024);
         assert_eq!(config.num_attention_heads, 8);
         assert_eq!(config.num_kv_heads, 4);
         assert_eq!(config.num_layers, 12);

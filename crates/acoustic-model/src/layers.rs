@@ -1,7 +1,7 @@
 //! Neural network layers for the acoustic model.
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder, linear};
+use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::config::AcousticModelConfig;
 
@@ -124,13 +124,17 @@ fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[rotated_x1, rotated_x2], candle_core::D::Minus1)
 }
 
-/// Multi-head attention layer with GQA support.
+/// Multi-head attention layer with GQA support and optional QK-Norm.
 #[derive(Debug)]
 pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    /// Optional Q normalization (per head_dim).
+    q_norm: Option<RmsNorm>,
+    /// Optional K normalization (per head_dim).
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -139,35 +143,48 @@ pub struct Attention {
 
 impl Attention {
     /// Create a new attention layer.
+    ///
+    /// Qwen3-TTS uses QK-Norm (per-head RMSNorm on Q and K after projection).
+    /// Attention projections have no bias (attention_bias: false in config).
     pub fn new(config: &AcousticModelConfig, vb: VarBuilder) -> Result<Self> {
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config.head_dim;
 
-        let q_proj = linear(
+        // Q projection: hidden_size -> num_heads * head_dim (no bias)
+        let q_proj = candle_nn::linear_no_bias(
             config.hidden_size,
             config.num_attention_heads * head_dim,
             vb.pp("q_proj"),
         )?;
-        let k_proj = linear(
+        // K projection: hidden_size -> num_kv_heads * head_dim (no bias)
+        let k_proj = candle_nn::linear_no_bias(
             config.hidden_size,
             config.num_kv_heads * head_dim,
             vb.pp("k_proj"),
         )?;
-        let v_proj = linear(
+        // V projection: hidden_size -> num_kv_heads * head_dim (no bias)
+        let v_proj = candle_nn::linear_no_bias(
             config.hidden_size,
             config.num_kv_heads * head_dim,
             vb.pp("v_proj"),
         )?;
-        let o_proj = linear(
+        // O projection: num_heads * head_dim -> hidden_size (no bias)
+        let o_proj = candle_nn::linear_no_bias(
             config.num_attention_heads * head_dim,
             config.hidden_size,
             vb.pp("o_proj"),
         )?;
+
+        // Try to load QK-Norm weights (Qwen3-TTS specific)
+        let q_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("q_norm")).ok();
+        let k_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("k_norm")).ok();
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim,
@@ -191,17 +208,26 @@ impl Attention {
         let v = self.v_proj.forward(x)?;
 
         // Reshape for multi-head attention
-        let q = q
+        let mut q = q
             .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?; // [B, H, S, D]
 
-        let k = k
+        let mut k = k
             .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
         let v = v
             .reshape((batch_size, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        // Apply QK-Norm if available (Qwen3-TTS specific)
+        // QK-Norm is applied per-head on the last dimension (head_dim)
+        if let Some(ref q_norm) = self.q_norm {
+            q = q_norm.forward(&q)?;
+        }
+        if let Some(ref k_norm) = self.k_norm {
+            k = k_norm.forward(&k)?;
+        }
 
         // Apply rotary embeddings
         let (q, k) = rope.forward(&q, &k, position_offset)?;
@@ -216,22 +242,22 @@ impl Attention {
         };
 
         // GQA: repeat KV heads if needed
-        let k = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
+        let k_expanded = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
+        let v_expanded = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
 
         // Scaled dot-product attention
         let attn_weights = (q
-            .matmul(&k.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?
+            .matmul(&k_expanded.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?
             * self.scale as f64)?;
 
         // Causal mask
-        let total_seq_len = k.dim(2)?;
+        let total_seq_len = k_expanded.dim(2)?;
         let mask = create_causal_mask(seq_len, total_seq_len, x.device())?;
         let attn_weights = attn_weights.broadcast_add(&mask)?;
 
         // Softmax and value projection
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = attn_weights.matmul(&v_expanded)?;
 
         // Reshape back
         let attn_output = attn_output.transpose(1, 2)?.reshape((
@@ -243,12 +269,8 @@ impl Attention {
         // Output projection
         let output = self.o_proj.forward(&attn_output)?;
 
-        // Return output and updated KV cache
-        // Note: We need to return the un-repeated K, V for caching
-        let k_cache = k.narrow(1, 0, self.num_kv_heads)?;
-        let v_cache = v.narrow(1, 0, self.num_kv_heads)?;
-
-        Ok((output, k_cache, v_cache))
+        // Return output and updated KV cache (original k, v without expansion)
+        Ok((output, k, v))
     }
 }
 
@@ -299,18 +321,20 @@ pub struct MLP {
 
 impl MLP {
     /// Create a new MLP layer.
+    ///
+    /// Qwen3-TTS MLP has no bias on any projections.
     pub fn new(config: &AcousticModelConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear(
+        let gate_proj = candle_nn::linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("gate_proj"),
         )?;
-        let up_proj = linear(
+        let up_proj = candle_nn::linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("up_proj"),
         )?;
-        let down_proj = linear(
+        let down_proj = candle_nn::linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
@@ -387,6 +411,34 @@ impl TransformerBlock {
         let x = (x + mlp_output)?;
 
         Ok((x, k_cache, v_cache))
+    }
+}
+
+/// Text projection layer for Qwen3-TTS.
+///
+/// Projects text embeddings from embedding_dim (2048) to hidden_size (1024).
+/// Architecture: Linear(2048, 2048) -> SiLU -> Linear(2048, 1024)
+#[derive(Debug)]
+pub struct TextProjection {
+    fc1: Linear,
+    fc2: Linear,
+}
+
+impl TextProjection {
+    /// Create a new text projection layer.
+    ///
+    /// TextProjection has bias unlike attention/MLP layers.
+    pub fn new(embedding_dim: usize, hidden_size: usize, vb: VarBuilder) -> Result<Self> {
+        let fc1 = candle_nn::linear(embedding_dim, embedding_dim, vb.pp("linear_fc1"))?;
+        let fc2 = candle_nn::linear(embedding_dim, hidden_size, vb.pp("linear_fc2"))?;
+        Ok(Self { fc1, fc2 })
+    }
+
+    /// Forward pass through the projection.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.fc1.forward(x)?;
+        let x = candle_nn::ops::silu(&x)?;
+        self.fc2.forward(&x)
     }
 }
 

@@ -4,23 +4,34 @@ use std::path::Path;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder, embedding};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::config::AcousticModelConfig;
-use crate::layers::{RmsNorm, RotaryEmbedding, TransformerBlock};
+use crate::layers::{RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
 use crate::sampling::{Sampler, SamplingConfig};
 
-/// The main acoustic model for Qwen3-TTS.
+/// The main acoustic model for Qwen3-TTS (Talker).
+///
+/// Qwen3-TTS architecture has:
+/// - `text_embedding`: [vocab_size, embedding_dim] - text token embeddings
+/// - `text_projection`: FC(embedding_dim→embedding_dim) + SiLU + FC(embedding_dim→hidden_size)
+/// - `codec_embedding`: [codec_vocab_size, hidden_size] - codec token embeddings
+/// - Transformer layers with QK-Norm
+/// - `codec_head`: [codec_vocab_size, hidden_size] - output projection
 #[derive(Debug)]
 pub struct Model {
-    /// Token embedding layer.
-    embed_tokens: Embedding,
+    /// Text token embedding layer [vocab_size, embedding_dim].
+    text_embedding: Embedding,
+    /// Text projection from embedding_dim to hidden_size.
+    text_projection: Option<TextProjection>,
+    /// Codec token embedding layer [codec_vocab_size, hidden_size].
+    codec_embedding: Embedding,
     /// Transformer decoder blocks.
     layers: Vec<TransformerBlock>,
     /// Final layer normalization.
     norm: RmsNorm,
-    /// Output projection to acoustic vocabulary.
-    lm_head: candle_nn::Linear,
+    /// Output projection to codec vocabulary.
+    codec_head: candle_nn::Linear,
     /// Rotary position embeddings.
     rotary_emb: RotaryEmbedding,
     /// Model configuration.
@@ -75,22 +86,58 @@ impl Model {
 
     /// Create model from VarBuilder (for testing or custom loading).
     pub fn from_vb(vb: VarBuilder, config: AcousticModelConfig, device: &Device) -> Result<Self> {
-        // Try Qwen3-TTS format first (talker.model.*), then fallback to standard format (model.*)
-        let vb_model = vb.pp("talker.model");
+        // Qwen3-TTS format: talker.model.*, talker.text_projection.*, talker.codec_head.*
+        let vb_talker = vb.pp("talker");
+        let vb_model = vb_talker.pp("model");
 
-        // Embedding layer - try text_embedding first (Qwen3), then embed_tokens (standard)
-        let embed_tokens = embedding(
+        // Text embedding layer [vocab_size, embedding_dim]
+        // Qwen3-TTS: talker.model.text_embedding.weight [151936, 2048]
+        let text_embedding = embedding(
             config.text_vocab_size,
-            config.hidden_size,
+            config.embedding_dim,
             vb_model.pp("text_embedding"),
         )
-        .or_else(|_| {
+        .or_else(|e| {
+            warn!("Failed to load text_embedding from talker.model: {}", e);
+            // Fallback to standard format
             embedding(
                 config.text_vocab_size,
-                config.hidden_size,
+                config.embedding_dim,
                 vb.pp("model.embed_tokens"),
             )
         })?;
+
+        // Text projection: embedding_dim -> hidden_size
+        // Only needed if embedding_dim != hidden_size
+        let text_projection = if config.embedding_dim != config.hidden_size {
+            match TextProjection::new(
+                config.embedding_dim,
+                config.hidden_size,
+                vb_talker.pp("text_projection"),
+            ) {
+                Ok(proj) => {
+                    info!(
+                        "Loaded text_projection: {} -> {}",
+                        config.embedding_dim, config.hidden_size
+                    );
+                    Some(proj)
+                }
+                Err(e) => {
+                    warn!("Failed to load text_projection: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Codec embedding layer [codec_vocab_size, hidden_size]
+        // Qwen3-TTS: talker.model.codec_embedding.weight [3072, 1024]
+        let codec_embedding = embedding(
+            config.codec_vocab_size,
+            config.hidden_size,
+            vb_model.pp("codec_embedding"),
+        )?;
 
         // Transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -103,12 +150,22 @@ impl Model {
         // Final norm
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
 
-        // LM head (outputs to codec vocabulary)
-        let lm_head = candle_nn::linear(
+        // Codec head (outputs to codec vocabulary)
+        // Qwen3-TTS: talker.codec_head.weight [3072, 1024]
+        let codec_head = candle_nn::linear_no_bias(
             config.hidden_size,
             config.codec_vocab_size,
-            vb.pp("lm_head"),
-        )?;
+            vb_talker.pp("codec_head"),
+        )
+        .or_else(|e| {
+            warn!("Failed to load codec_head from talker: {}", e);
+            // Fallback to lm_head
+            candle_nn::linear(
+                config.hidden_size,
+                config.codec_vocab_size,
+                vb.pp("lm_head"),
+            )
+        })?;
 
         // Rotary embeddings
         let head_dim = config.head_dim;
@@ -120,15 +177,21 @@ impl Model {
         )?;
 
         info!(
-            "Model loaded: {} layers, {} hidden, {} vocab",
-            config.num_layers, config.hidden_size, config.text_vocab_size
+            "Model loaded: {} layers, hidden={}, embedding={}, text_vocab={}, codec_vocab={}",
+            config.num_layers,
+            config.hidden_size,
+            config.embedding_dim,
+            config.text_vocab_size,
+            config.codec_vocab_size
         );
 
         Ok(Self {
-            embed_tokens,
+            text_embedding,
+            text_projection,
+            codec_embedding,
             layers,
             norm,
-            lm_head,
+            codec_head,
             rotary_emb,
             config,
             device: device.clone(),
@@ -145,7 +208,26 @@ impl Model {
         &self.device
     }
 
+    /// Embed text tokens (apply text_embedding + text_projection).
+    fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let embedded = self.text_embedding.forward(input_ids)?;
+        if let Some(ref proj) = self.text_projection {
+            proj.forward(&embedded)
+        } else {
+            Ok(embedded)
+        }
+    }
+
+    /// Embed codec tokens.
+    fn embed_codec(&self, codec_ids: &Tensor) -> Result<Tensor> {
+        self.codec_embedding.forward(codec_ids)
+    }
+
     /// Forward pass through the model.
+    ///
+    /// `input_ids` can be either text tokens or codec tokens.
+    /// For text tokens (< text_vocab_size), applies text_embedding + text_projection.
+    /// For codec tokens, applies codec_embedding.
     ///
     /// Returns logits for the next token and updated KV caches.
     #[instrument(skip(self, input_ids, kv_caches))]
@@ -155,8 +237,12 @@ impl Model {
         position_offset: usize,
         kv_caches: Option<&[(Tensor, Tensor)]>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        // Embed input tokens
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        // For now, assume all input_ids are text tokens or codec tokens uniformly
+        // In practice, need to handle mixed sequences based on token ranges
+        // TODO: Handle mixed text/codec sequences properly
+
+        // Embed input tokens - use text embedding for now
+        let mut hidden_states = self.embed_text(input_ids)?;
 
         // Pass through transformer layers
         let mut new_kv_caches = Vec::with_capacity(self.layers.len());
@@ -174,40 +260,115 @@ impl Model {
         // Final norm
         let hidden_states = self.norm.forward(&hidden_states)?;
 
-        // Project to vocabulary
-        let logits = self.lm_head.forward(&hidden_states)?;
+        // Project to codec vocabulary
+        let logits = self.codec_head.forward(&hidden_states)?;
 
         Ok((logits, new_kv_caches))
     }
 
-    /// Generate acoustic tokens autoregressively.
-    #[instrument(skip(self, input_ids, sampling_config))]
+    /// Forward pass with explicit text and codec token handling.
+    ///
+    /// This is the proper forward pass for Qwen3-TTS that handles
+    /// mixed text/codec sequences correctly.
+    #[instrument(skip(self, text_ids, codec_ids, kv_caches))]
+    pub fn forward_mixed(
+        &self,
+        text_ids: Option<&Tensor>,
+        codec_ids: Option<&Tensor>,
+        position_offset: usize,
+        kv_caches: Option<&[(Tensor, Tensor)]>,
+    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        // Embed tokens based on type
+        let hidden_states = match (text_ids, codec_ids) {
+            (Some(text), None) => self.embed_text(text)?,
+            (None, Some(codec)) => self.embed_codec(codec)?,
+            (Some(text), Some(codec)) => {
+                let text_hidden = self.embed_text(text)?;
+                let codec_hidden = self.embed_codec(codec)?;
+                Tensor::cat(&[text_hidden, codec_hidden], 1)?
+            }
+            (None, None) => {
+                return Err(candle_core::Error::Msg(
+                    "Must provide either text_ids or codec_ids".to_string(),
+                ));
+            }
+        };
+
+        let mut hidden_states = hidden_states;
+
+        // Pass through transformer layers
+        let mut new_kv_caches = Vec::with_capacity(self.layers.len());
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
+
+            let (new_hidden, k_cache, v_cache) =
+                layer.forward(&hidden_states, &self.rotary_emb, position_offset, kv_cache)?;
+
+            hidden_states = new_hidden;
+            new_kv_caches.push((k_cache, v_cache));
+        }
+
+        // Final norm
+        let hidden_states = self.norm.forward(&hidden_states)?;
+
+        // Project to codec vocabulary
+        let logits = self.codec_head.forward(&hidden_states)?;
+
+        Ok((logits, new_kv_caches))
+    }
+
+    /// Generate acoustic tokens autoregressively from text tokens.
+    ///
+    /// Uses forward_mixed to properly handle text prefill and codec generation.
+    #[instrument(skip(self, text_ids, sampling_config))]
     pub fn generate(
         &self,
-        input_ids: &[u32],
+        text_ids: &[u32],
         max_new_tokens: usize,
         sampling_config: SamplingConfig,
         eos_token_id: Option<u32>,
     ) -> Result<Vec<u32>> {
         info!(
-            "Generating up to {} tokens from {} input tokens",
+            "Generating up to {} tokens from {} text tokens",
             max_new_tokens,
-            input_ids.len()
+            text_ids.len()
         );
 
         let mut sampler = Sampler::new(sampling_config);
         let mut generated = Vec::with_capacity(max_new_tokens);
-        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = None;
 
-        // Create input tensor
-        let mut current_ids = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?; // [1, seq_len]
+        // Prefill with text tokens
+        let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, seq_len]
+        let (logits, new_kv_caches) = self.forward_mixed(Some(&text_tensor), None, 0, None)?;
 
-        let mut position_offset = 0;
+        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(new_kv_caches);
+        let mut position_offset = text_ids.len();
 
-        for step in 0..max_new_tokens {
-            // Forward pass
-            let (logits, new_kv_caches) =
-                self.forward(&current_ids, position_offset, kv_caches.as_deref())?;
+        // Sample first codec token from prefill logits
+        let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
+        let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+        let mut current_token = sampler.sample(&logits_vec);
+
+        // Check for EOS
+        if Some(current_token) == eos_token_id {
+            info!("EOS token generated at prefill");
+            return Ok(generated);
+        }
+        generated.push(current_token);
+
+        // Generate remaining tokens
+        for step in 1..max_new_tokens {
+            // Create codec token tensor
+            let codec_tensor = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
+
+            // Forward pass with codec token
+            let (logits, new_kv_caches) = self.forward_mixed(
+                None,
+                Some(&codec_tensor),
+                position_offset,
+                kv_caches.as_deref(),
+            )?;
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -227,8 +388,8 @@ impl Model {
 
             // Update for next iteration
             kv_caches = Some(new_kv_caches);
-            position_offset += current_ids.dim(1)?;
-            current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
+            position_offset += 1;
+            current_token = next_token;
         }
 
         info!("Generated {} tokens", generated.len());

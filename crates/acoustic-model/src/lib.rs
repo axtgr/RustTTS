@@ -50,7 +50,7 @@ pub mod sampling;
 pub use cache::{CacheEntry, CacheHandle, KvCacheManager};
 pub use code_predictor::{CodePredictor, MultiCodebookOutput};
 pub use config::{AcousticModelConfig, CodePredictorConfig};
-pub use layers::{Attention, MLP, RmsNorm, RotaryEmbedding, TransformerBlock};
+pub use layers::{Attention, MLP, RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
 pub use model::{Model, StreamingGenerator};
 pub use sampling::{Sampler, SamplingConfig};
 

@@ -5,7 +5,7 @@
 //! 16 codebooks for ultra-low-latency streaming.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder, embedding, linear};
+use candle_nn::{Embedding, Module, VarBuilder, embedding};
 use tracing::{debug, info, instrument};
 
 use crate::config::CodePredictorConfig;
@@ -69,6 +69,7 @@ impl CodePredictor {
         // Create a temporary AcousticModelConfig for transformer blocks
         let acoustic_config = crate::config::AcousticModelConfig {
             hidden_size: config.hidden_size,
+            embedding_dim: config.hidden_size, // Same as hidden_size for code predictor
             num_attention_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             num_layers: config.num_layers,
@@ -104,10 +105,11 @@ impl CodePredictor {
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
 
         // Separate LM head for each residual codebook (groups 1 to num_code_groups-1)
+        // Qwen3-TTS uses linear_no_bias for lm_heads
         let num_residual_groups = config.num_code_groups - 1;
         let mut lm_heads = Vec::with_capacity(num_residual_groups);
         for i in 0..num_residual_groups {
-            let head = linear(
+            let head = candle_nn::linear_no_bias(
                 config.hidden_size,
                 config.codebook_size,
                 vb_model.pp(format!("lm_head.{i}")),
