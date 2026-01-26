@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
     conv_transpose1d, conv1d,
@@ -1356,6 +1356,22 @@ impl NeuralDecoder {
             sum_embedding.ok_or_else(|| candle_core::Error::Msg("No embeddings".to_string()))?;
         debug!("After RVQ sum: {:?}", x.dims());
 
+        // Debug: check embedding statistics
+        {
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug!(
+                "RVQ embedding stats - mean: {:.4}, std: {:.4}, min: {:.4}, max: {:.4}",
+                mean,
+                std,
+                x_flat.iter().cloned().fold(f32::INFINITY, f32::min),
+                x_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            );
+        }
+
         // Step 3: Pre-conv [1024, 512, 3]
         let x = pre_conv.forward(&x)?;
         debug!("After pre_conv: {:?}", x.dims());
@@ -1377,6 +1393,22 @@ impl NeuralDecoder {
 
         x = self.decode_hifi_gan(x)?;
 
+        // Debug: final audio stats before squeeze
+        {
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug!(
+                "Final audio stats - mean: {:.4}, std: {:.4}, min: {:.4}, max: {:.4}",
+                mean,
+                std,
+                x_flat.iter().cloned().fold(f32::INFINITY, f32::min),
+                x_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            );
+        }
+
         // Squeeze and convert to Vec
         let x = x.squeeze(0)?.squeeze(0)?;
         x.to_vec1()
@@ -1389,21 +1421,142 @@ impl NeuralDecoder {
         // Process through HiFi-GAN upsample blocks
         if let Some(ref hifi_blocks) = self.hifi_blocks {
             for (i, block) in hifi_blocks.iter().enumerate() {
+                // Stats before block
+                let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+                let std_before: f32 =
+                    (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+
                 x = block.forward(&x)?;
-                debug!("HiFi-GAN block {} output shape: {:?}", i, x.dims());
+
+                // Stats after block
+                let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+                let std_after: f32 =
+                    (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+                debug!(
+                    "HiFi-GAN block {} output shape: {:?}, std: {:.4} -> {:.4}",
+                    i,
+                    x.dims(),
+                    std_before,
+                    std_after
+                );
             }
         }
 
         // Final Snake activation
         if let Some(ref snake) = self.final_snake {
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let std_before: f32 =
+                (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+
+            // Debug: print Snake parameters
+            let alpha_flat: Vec<f32> = snake.alpha.to_vec1()?;
+            let alpha_exp: Vec<f32> = snake.alpha.exp()?.to_vec1()?;
+            debug!(
+                "final_snake alpha[:5]: {:?}, exp(alpha)[:5]: {:?}",
+                &alpha_flat[..5.min(alpha_flat.len())],
+                &alpha_exp[..5.min(alpha_exp.len())]
+            );
+            if let Some(ref beta) = snake.beta {
+                let beta_flat: Vec<f32> = beta.to_vec1()?;
+                let beta_exp: Vec<f32> = beta.exp()?.to_vec1()?;
+                debug!(
+                    "final_snake beta[:5]: {:?}, exp(beta)[:5]: {:?}",
+                    &beta_flat[..5.min(beta_flat.len())],
+                    &beta_exp[..5.min(beta_exp.len())]
+                );
+            }
+
             x = snake.forward(&x)?;
+
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let std_after: f32 =
+                (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+            debug!(
+                "After final Snake: std {:.4} -> {:.4}",
+                std_before, std_after
+            );
         }
 
         // Output projection
-        let x = self.output_conv.forward(&x)?;
+        {
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let std_before: f32 =
+                (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
 
-        // Apply tanh to constrain output to [-1, 1]
-        x.tanh()
+            // Debug: check output_conv weights
+            let conv_weight = self.output_conv.weight();
+            let w_flat: Vec<f32> = conv_weight.flatten_all()?.to_vec1()?;
+            let w_std: f32 =
+                (w_flat.iter().map(|v| v.powi(2)).sum::<f32>() / w_flat.len() as f32).sqrt();
+            debug!(
+                "output_conv weight shape: {:?}, std: {:.6}",
+                conv_weight.dims(),
+                w_std
+            );
+
+            // Print first few weight values for comparison with Python
+            let w_first7: Vec<f32> = conv_weight.i((0, 0, ..))?.to_vec1()?;
+            debug!("output_conv weight[0,0,:7]: {:?}", w_first7);
+
+            // Print input dimensions
+            debug!("Input to output_conv shape: {:?}", x.dims());
+
+            // Print first few input values across channels for comparison
+            let x_ch0: Vec<f32> = x.i((0, 0, 0..10))?.to_vec1()?;
+            let x_ch1: Vec<f32> = x.i((0, 1, 0..10))?.to_vec1()?;
+            let x_ch95: Vec<f32> = x.i((0, 95, 0..10))?.to_vec1()?;
+            debug!("Input x[0,0,:10]: {:?}", x_ch0);
+            debug!("Input x[0,1,:10]: {:?}", x_ch1);
+            debug!("Input x[0,95,:10]: {:?}", x_ch95);
+
+            // Check std per channel
+            let mut channel_stds = Vec::with_capacity(96);
+            for c in 0..96 {
+                let ch_data: Vec<f32> = x.i((0, c, ..))?.to_vec1()?;
+                let ch_std =
+                    (ch_data.iter().map(|v| v.powi(2)).sum::<f32>() / ch_data.len() as f32).sqrt();
+                channel_stds.push(ch_std);
+            }
+            let max_std = channel_stds
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_std = channel_stds.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mean_std: f32 = channel_stds.iter().sum::<f32>() / 96.0;
+            debug!(
+                "Channel std distribution: min={:.4}, mean={:.4}, max={:.4}",
+                min_std, mean_std, max_std
+            );
+
+            // Count channels with std > 10
+            let high_std_count = channel_stds.iter().filter(|&&s| s > 10.0).count();
+            debug!("Channels with std > 10: {}/96", high_std_count);
+
+            // Also check weight values for channels 1 and 95
+            let w_ch1: Vec<f32> = conv_weight.i((0, 1, ..))?.to_vec1()?;
+            let w_ch95: Vec<f32> = conv_weight.i((0, 95, ..))?.to_vec1()?;
+            debug!("output_conv weight[0,1,:7]: {:?}", w_ch1);
+            debug!("output_conv weight[0,95,:7]: {:?}", w_ch95);
+
+            let x_out = self.output_conv.forward(&x)?;
+
+            let x_flat: Vec<f32> = x_out.flatten_all()?.to_vec1()?;
+            let std_after: f32 =
+                (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+            debug!(
+                "After output_conv: std {:.4} -> {:.4}",
+                std_before, std_after
+            );
+
+            // Apply tanh
+            let x_tanh = x_out.tanh()?;
+            let x_flat: Vec<f32> = x_tanh.flatten_all()?.to_vec1()?;
+            let std_tanh: f32 =
+                (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
+            debug!("After tanh: std {:.4}", std_tanh);
+
+            return Ok(x_tanh);
+        }
     }
 
     /// Decode using legacy upsampling (when HiFi-GAN weights not available).
@@ -1487,32 +1640,47 @@ impl Snake {
         Ok(Self { alpha, beta })
     }
 
-    /// Forward pass: x + (1/alpha) * sin²(alpha * x)
+    /// Forward pass: x + (1/exp(beta)) * sin²(x * exp(alpha))
+    ///
+    /// This matches Python SnakeBeta implementation:
+    /// alpha = exp(alpha_param)
+    /// beta = exp(beta_param)
+    /// output = x + (1/beta) * sin²(x * alpha)
     ///
     /// Input shape: [batch, channels, seq_len]
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // Reshape alpha for broadcasting: [1, channels, 1]
-        let alpha = self.alpha.unsqueeze(0)?.unsqueeze(2)?;
+        let alpha_param = self.alpha.unsqueeze(0)?.unsqueeze(2)?;
 
-        // Compute alpha * x
+        // Apply exp to get actual alpha (matching Python: alpha = torch.exp(alpha))
+        let alpha = alpha_param.exp()?;
+
+        // Compute x * alpha
         let ax = x.broadcast_mul(&alpha)?;
 
-        // Compute sin²(alpha * x)
+        // Compute sin²(x * alpha)
         let sin_ax = ax.sin()?;
         let sin_sq = (&sin_ax * &sin_ax)?;
 
-        // Compute 1/alpha
-        let inv_alpha = (1.0 / &alpha)?;
+        // Get beta and compute 1/beta
+        if let Some(ref beta_param) = self.beta {
+            // Apply exp to get actual beta (matching Python: beta = torch.exp(beta))
+            let beta_param = beta_param.unsqueeze(0)?.unsqueeze(2)?;
+            let beta = beta_param.exp()?;
 
-        // x + (1/alpha) * sin²(alpha * x)
-        let activation = (x + &(sin_sq.broadcast_mul(&inv_alpha)?))?;
+            // Small epsilon to avoid division by zero (matching Python: no_div_by_zero = 1e-9)
+            let eps = 1e-9_f64;
+            let beta_safe = (beta + eps)?;
+            let inv_beta = (1.0 / beta_safe)?;
 
-        // Apply beta scaling if present
-        if let Some(ref beta) = self.beta {
-            let beta = beta.unsqueeze(0)?.unsqueeze(2)?;
-            activation.broadcast_mul(&beta)
+            // x + (1/beta) * sin²(x * alpha)
+            let term = sin_sq.broadcast_mul(&inv_beta)?;
+            x + &term
         } else {
-            Ok(activation)
+            // Fallback: just use 1/alpha (original Snake formula without beta)
+            let inv_alpha = (1.0 / &alpha)?;
+            let term = sin_sq.broadcast_mul(&inv_alpha)?;
+            x + &term
         }
     }
 }

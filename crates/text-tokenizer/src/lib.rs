@@ -278,10 +278,20 @@ impl Tokenizer {
         // Create tokenizer with BPE model
         let mut inner = tokenizers::Tokenizer::new(bpe);
 
-        // Add byte-level pre-tokenizer (same as GPT-2/Qwen)
-        inner.with_pre_tokenizer(Some(ByteLevel::default()));
+        // Add byte-level pre-tokenizer matching Python's tokenizer_config.json:
+        // add_prefix_space=false, trim_offsets=true, use_regex=true (GPT-2 style)
+        inner.with_pre_tokenizer(Some(ByteLevel::new(
+            false, // add_prefix_space - CRITICAL: must be false to match Python tokenizer
+            true,  // trim_offsets
+            true,  // use_regex (GPT-2 style splitting)
+        )));
         inner.with_decoder(Some(ByteLevelDecoder::default()));
-        inner.with_post_processor(Some(ByteLevelProcessor::default()));
+        // Post-processor with matching settings (trim_offsets=true)
+        inner.with_post_processor(Some(ByteLevelProcessor::new(
+            false, // add_prefix_space
+            true,  // trim_offsets
+            true,  // use_regex
+        )));
 
         info!(
             vocab_size = inner.get_vocab_size(true),

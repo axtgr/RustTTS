@@ -625,6 +625,12 @@ impl TtsPipeline {
         text_seq.extend_from_slice(text_tokens);
         text_seq.push(st.tts_eos_token_id);
 
+        info!(
+            "Text tokens for position 9+: {:?}, codec_seq: {:?}",
+            text_seq,
+            vec![st.codec_pad_id; text_seq.len()]
+        );
+
         // All codec_pad for text tokens
         let codec_seq: Vec<u32> = vec![st.codec_pad_id; text_seq.len()];
 
@@ -911,6 +917,11 @@ impl TtsPipeline {
 
         let codec_seq: Vec<u32> = vec![st.codec_pad_id; text_seq.len()];
 
+        debug!(
+            "Multi-codebook text tokens: {:?}, codec_seq: {:?}",
+            text_seq, codec_seq
+        );
+
         let text_seq_tensor = Tensor::new(text_seq.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
@@ -1083,6 +1094,13 @@ impl TtsPipeline {
             result.len(),
             result[0].len()
         );
+
+        // Debug: print first few tokens of each codebook
+        debug!("Generated codec tokens (first 10 per codebook):");
+        for (i, cb) in result.iter().enumerate() {
+            let preview: Vec<_> = cb.iter().take(10).collect();
+            debug!("  Codebook {}: {:?}", i, preview);
+        }
 
         Ok(result)
     }

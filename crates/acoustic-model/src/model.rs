@@ -4,7 +4,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder, embedding};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::code_predictor::CodePredictor;
 use crate::config::AcousticModelConfig;
@@ -839,7 +839,7 @@ impl Model {
         // Debug: log input embeddings (only for prefill)
         if position_offset == 0 && seq_len > 1 {
             let input_first20: Vec<f32> = hidden_states.i((0, seq_len - 1, ..20))?.to_vec1()?;
-            debug!(
+            trace!(
                 "forward_embeds input (last pos, first 20): {:?}",
                 input_first20
             );

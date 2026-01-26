@@ -243,24 +243,65 @@ fn test_streaming_encode_no_punctuation() {
 mod golden_tests {
     use super::*;
 
-    /// Golden test for specific input -> token IDs mapping.
-    /// These values should be verified against the reference tokenizer.
-    #[test]
-    fn test_golden_hello_world() {
-        let path = fixture_path("test_tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&path).expect("should load tokenizer");
+    fn model_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("models/qwen3-tts-0.6b-customvoice")
+    }
 
-        let text = NormText::new("Hello World", Lang::En);
+    /// Golden test for tokenization matching Python SDK.
+    /// These token IDs are verified against transformers AutoTokenizer.
+    #[test]
+    fn test_golden_tokenization_matches_python() {
+        let tokenizer =
+            Tokenizer::from_pretrained(model_path()).expect("should load model tokenizer");
+
+        // Test cases verified against Python:
+        // from transformers import AutoTokenizer
+        // tok = AutoTokenizer.from_pretrained("models/qwen3-tts-0.6b-customvoice")
+        // tok.encode("Hello", add_special_tokens=False) -> [9707]
+
+        let test_cases = [
+            ("Hello", vec![9707]),
+            ("Hello world", vec![9707, 1879]),
+            (
+                "Hello, my name is Ryan.",
+                vec![9707, 11, 847, 829, 374, 13646, 13],
+            ),
+            ("Testing 123", vec![16451, 220, 16, 17, 18]),
+        ];
+
+        for (text, expected_tokens) in test_cases {
+            let norm_text = NormText::new(text, Lang::En);
+            let tokens = tokenizer.encode(&norm_text).expect("should encode");
+
+            assert_eq!(
+                tokens.ids, expected_tokens,
+                "Token mismatch for '{}': got {:?}, expected {:?}",
+                text, tokens.ids, expected_tokens
+            );
+        }
+    }
+
+    /// Verify add_prefix_space=false behavior.
+    /// "Hello" should tokenize to [9707], NOT [21927] (which is " Hello" with prefix space).
+    #[test]
+    fn test_no_prefix_space() {
+        let tokenizer =
+            Tokenizer::from_pretrained(model_path()).expect("should load model tokenizer");
+
+        let text = NormText::new("Hello", Lang::En);
         let tokens = tokenizer.encode(&text).expect("should encode");
 
-        // Log the token IDs for debugging
-        println!("Hello World tokens: {:?}", tokens.ids);
-
-        // These IDs depend on the actual tokenizer configuration
-        // Update these values based on the reference implementation
-        assert!(
-            tokens.ids.contains(&193) || tokens.ids.contains(&194),
-            "Should contain Hello token"
+        // 9707 = "Hello" (no prefix space)
+        // 21927 = " Hello" (with prefix space) - WRONG if this appears
+        assert_eq!(
+            tokens.ids,
+            vec![9707],
+            "Should tokenize 'Hello' to [9707], not [21927] (prefix space bug)"
         );
     }
 }

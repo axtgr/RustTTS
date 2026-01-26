@@ -550,7 +550,7 @@ impl Attention {
 
         if debug {
             let q_normed: Vec<f32> = q.i((0, 0, seq_len - 1, ..10))?.to_vec1()?;
-            tracing::debug!("Q normed head0 last pos, first 10: {:?}", q_normed);
+            tracing::trace!("Q normed head0 last pos, first 10: {:?}", q_normed);
         }
 
         // Apply rotary embeddings
@@ -558,9 +558,9 @@ impl Attention {
 
         if debug {
             let q_rope: Vec<f32> = q.i((0, 0, seq_len - 1, ..10))?.to_vec1()?;
-            tracing::debug!("Q rope head0 last pos, first 10: {:?}", q_rope);
+            tracing::trace!("Q rope head0 last pos, first 10: {:?}", q_rope);
             let k_rope: Vec<f32> = k.i((0, 0, seq_len - 1, ..10))?.to_vec1()?;
-            tracing::debug!("K rope head0 last pos, first 10: {:?}", k_rope);
+            tracing::trace!("K rope head0 last pos, first 10: {:?}", k_rope);
         }
 
         // Handle KV cache
@@ -794,7 +794,7 @@ impl TransformerBlock {
 
         if debug && position_offset == 0 && seq_len > 1 {
             let normed_vals: Vec<f32> = normed.i((0, seq_len - 1, ..20))?.to_vec1()?;
-            tracing::debug!(
+            tracing::trace!(
                 "After input_layernorm, last pos, first 20: {:?}",
                 normed_vals
             );
@@ -807,7 +807,7 @@ impl TransformerBlock {
 
         if debug && position_offset == 0 && x.dim(1)? > 1 {
             let after_attn: Vec<f32> = x.i((0, x.dim(1)? - 1, ..20))?.to_vec1()?;
-            tracing::debug!(
+            tracing::trace!(
                 "After attention + residual, last pos, first 20: {:?}",
                 after_attn
             );
@@ -818,7 +818,7 @@ impl TransformerBlock {
 
         if debug && position_offset == 0 && normed.dim(1)? > 1 {
             let post_ln: Vec<f32> = normed.i((0, normed.dim(1)? - 1, ..20))?.to_vec1()?;
-            tracing::debug!(
+            tracing::trace!(
                 "After post_attention_layernorm, last pos, first 20: {:?}",
                 post_ln
             );
@@ -828,7 +828,7 @@ impl TransformerBlock {
 
         if debug && position_offset == 0 && mlp_output.dim(1)? > 1 {
             let mlp_out: Vec<f32> = mlp_output.i((0, mlp_output.dim(1)? - 1, ..20))?.to_vec1()?;
-            tracing::debug!("MLP output, last pos, first 20: {:?}", mlp_out);
+            tracing::trace!("MLP output, last pos, first 20: {:?}", mlp_out);
         }
 
         let x = (x + mlp_output)?;
