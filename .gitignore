@@ -16,6 +16,7 @@ Thumbs.db
 
 # Model weights (large files)
 /weights/
+/models/
 *.safetensors
 *.bin
 *.pt

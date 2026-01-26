@@ -75,14 +75,22 @@ impl Model {
 
     /// Create model from VarBuilder (for testing or custom loading).
     pub fn from_vb(vb: VarBuilder, config: AcousticModelConfig, device: &Device) -> Result<Self> {
-        let vb_model = vb.pp("model");
+        // Try Qwen3-TTS format first (talker.model.*), then fallback to standard format (model.*)
+        let vb_model = vb.pp("talker.model");
 
-        // Embedding layer
+        // Embedding layer - try text_embedding first (Qwen3), then embed_tokens (standard)
         let embed_tokens = embedding(
             config.text_vocab_size,
             config.hidden_size,
-            vb_model.pp("embed_tokens"),
-        )?;
+            vb_model.pp("text_embedding"),
+        )
+        .or_else(|_| {
+            embedding(
+                config.text_vocab_size,
+                config.hidden_size,
+                vb.pp("model.embed_tokens"),
+            )
+        })?;
 
         // Transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
