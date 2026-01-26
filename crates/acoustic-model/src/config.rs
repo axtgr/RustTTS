@@ -44,6 +44,14 @@ pub struct AcousticModelConfig {
     /// RMS norm epsilon.
     pub rms_norm_eps: f64,
 
+    // Multimodal RoPE (mrope) settings
+    /// Whether to use interleaved multimodal RoPE.
+    pub mrope_interleaved: bool,
+    /// Multimodal RoPE section sizes [temporal, height, width].
+    /// Each section corresponds to a different position_id component.
+    /// Sum of sections should equal head_dim / 2 (half rotation dimension).
+    pub mrope_section: Vec<usize>,
+
     // Special tokens
     /// TTS BOS token ID in text vocabulary.
     pub tts_bos_token_id: u32,
@@ -149,6 +157,30 @@ impl AcousticModelConfig {
         let rope_theta = get_f64("rope_theta", 1_000_000.0);
         let rms_norm_eps = get_f64("rms_norm_eps", 1e-6);
 
+        // Parse rope_scaling for multimodal RoPE
+        let rope_scaling = talker
+            .and_then(|t| t.get("rope_scaling"))
+            .or_else(|| v.get("rope_scaling"));
+
+        let (mrope_interleaved, mrope_section) = if let Some(rs) = rope_scaling {
+            let interleaved = rs
+                .get("interleaved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let section = rs
+                .get("mrope_section")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (interleaved, section)
+        } else {
+            (false, vec![])
+        };
+
         // Special tokens - from root level in Qwen3-TTS
         let tts_bos_token_id = v
             .get("tts_bos_token_id")
@@ -184,6 +216,8 @@ impl AcousticModelConfig {
             max_position_embeddings,
             rope_theta,
             rms_norm_eps,
+            mrope_interleaved,
+            mrope_section,
             tts_bos_token_id,
             tts_eos_token_id,
             tts_pad_token_id,
@@ -203,7 +237,9 @@ impl AcousticModelConfig {
             num_kv_heads: 8,
             num_layers: 28,
             intermediate_size: 3072,
-            head_dim: 128, // num_heads * head_dim = 16 * 128 = 2048 for Q
+            // IMPORTANT: head_dim is explicitly 128 in config.json, NOT hidden_size/num_heads!
+            // This means Q projection is [num_heads * head_dim, hidden_size] = [2048, 1024]
+            head_dim: 128,
 
             // Vocabulary
             text_vocab_size: 151936,
@@ -215,6 +251,11 @@ impl AcousticModelConfig {
             max_position_embeddings: 32768,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
+
+            // Multimodal RoPE (from config.json rope_scaling)
+            // mrope_section sum = 64 = head_dim / 2 (for half rotation dimension)
+            mrope_interleaved: true,
+            mrope_section: vec![24, 20, 20], // temporal, height, width
 
             // Special tokens (from config.json)
             tts_bos_token_id: 151672,
@@ -249,6 +290,10 @@ impl AcousticModelConfig {
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
 
+            // Multimodal RoPE (estimated, needs verification)
+            mrope_interleaved: true,
+            mrope_section: vec![48, 40, 40], // estimated for head_dim=128
+
             // Special tokens (same as 0.6B)
             tts_bos_token_id: 151672,
             tts_eos_token_id: 151673,
@@ -278,6 +323,10 @@ impl AcousticModelConfig {
             max_position_embeddings: 256,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-6,
+
+            // No multimodal RoPE for tiny config
+            mrope_interleaved: false,
+            mrope_section: vec![],
 
             tts_bos_token_id: 1,
             tts_eos_token_id: 2,
@@ -311,6 +360,10 @@ impl AcousticModelConfig {
             max_position_embeddings: 8192,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-6,
+
+            // No multimodal RoPE for legacy
+            mrope_interleaved: false,
+            mrope_section: vec![],
 
             tts_bos_token_id: 151672,
             tts_eos_token_id: 151673,
@@ -412,10 +465,18 @@ mod tests {
         assert_eq!(config.num_attention_heads, 16);
         assert_eq!(config.num_kv_heads, 8);
         assert_eq!(config.num_layers, 28);
+        assert_eq!(config.head_dim, 128); // Explicitly 128, NOT hidden_size/num_heads!
         assert_eq!(config.text_vocab_size, 151936);
         assert_eq!(config.codec_vocab_size, 3072);
         assert_eq!(config.num_code_groups, 16);
         assert_eq!(config.codebook_size, 2048);
+        // Multimodal RoPE: section sum = head_dim / 2 (half for rotation)
+        assert!(config.mrope_interleaved);
+        assert_eq!(config.mrope_section, vec![24, 20, 20]);
+        assert_eq!(
+            config.mrope_section.iter().sum::<usize>(),
+            config.head_dim / 2
+        );
     }
 
     #[test]
@@ -463,6 +524,10 @@ mod tests {
                 "max_position_embeddings": 4096,
                 "rope_theta": 100000.0,
                 "rms_norm_eps": 1e-5,
+                "rope_scaling": {
+                    "interleaved": true,
+                    "mrope_section": [24, 20, 20]
+                },
                 "codec_bos_id": 10,
                 "codec_eos_token_id": 11,
                 "codec_pad_id": 0
@@ -484,6 +549,9 @@ mod tests {
         assert_eq!(config.max_position_embeddings, 4096);
         assert!((config.rope_theta - 100000.0).abs() < 1e-6);
         assert!((config.rms_norm_eps - 1e-5).abs() < 1e-10);
+        // Multimodal RoPE
+        assert!(config.mrope_interleaved);
+        assert_eq!(config.mrope_section, vec![24, 20, 20]);
         assert_eq!(config.tts_bos_token_id, 100);
         assert_eq!(config.tts_eos_token_id, 101);
         assert_eq!(config.codec_bos_id, 10);
@@ -506,6 +574,9 @@ mod tests {
         assert_eq!(config.num_attention_heads, 16);
         assert_eq!(config.codec_vocab_size, 3072);
         assert_eq!(config.tts_bos_token_id, 151672);
+        // No multimodal RoPE without rope_scaling
+        assert!(!config.mrope_interleaved);
+        assert!(config.mrope_section.is_empty());
     }
 
     #[test]

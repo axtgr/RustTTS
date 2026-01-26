@@ -91,6 +91,7 @@ impl CodePredictor {
         let mut layers = Vec::with_capacity(config.num_layers);
 
         // Create a temporary AcousticModelConfig for transformer blocks
+        // CodePredictor does NOT use multimodal RoPE - it uses standard RoPE
         let acoustic_config = crate::config::AcousticModelConfig {
             hidden_size: config.hidden_size,
             embedding_dim: config.hidden_size, // Same as hidden_size for code predictor
@@ -106,6 +107,9 @@ impl CodePredictor {
             max_position_embeddings: config.max_position_embeddings,
             rope_theta: config.rope_theta,
             rms_norm_eps: config.rms_norm_eps,
+            // CodePredictor uses standard RoPE, not multimodal
+            mrope_interleaved: false,
+            mrope_section: vec![],
             tts_bos_token_id: 0,
             tts_eos_token_id: 0,
             tts_pad_token_id: 0,
