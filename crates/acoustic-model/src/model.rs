@@ -351,16 +351,29 @@ impl Model {
     ///
     /// Uses forward_mixed to properly handle text prefill and codec generation.
     /// Returns only the zeroth codebook tokens.
+    ///
+    /// # Arguments
+    /// - `text_ids`: Text tokens (including tts_bos, but NOT codec_bos)
+    /// - `codec_bos_id`: The codec BOS token ID to start generation
+    /// - `max_new_tokens`: Maximum number of tokens to generate
+    /// - `sampling_config`: Sampling configuration
+    /// - `eos_token_id`: EOS token ID to stop generation
     #[instrument(skip(self, text_ids, sampling_config))]
     pub fn generate(
         &self,
         text_ids: &[u32],
+        codec_bos_id: u32,
         max_new_tokens: usize,
         sampling_config: SamplingConfig,
         eos_token_id: Option<u32>,
     ) -> Result<Vec<u32>> {
-        let (tokens, _) =
-            self.generate_with_hidden(text_ids, max_new_tokens, sampling_config, eos_token_id)?;
+        let (tokens, _) = self.generate_with_hidden(
+            text_ids,
+            codec_bos_id,
+            max_new_tokens,
+            sampling_config,
+            eos_token_id,
+        )?;
         Ok(tokens)
     }
 
@@ -370,55 +383,77 @@ impl Model {
     /// hidden states from each generation step, which can be used by
     /// CodePredictor to predict residual codebooks (1-15).
     ///
+    /// # Arguments
+    /// - `text_ids`: Text tokens (including tts_bos, but NOT codec_bos)
+    /// - `codec_bos_id`: The codec BOS token ID to start generation
+    /// - `max_new_tokens`: Maximum number of tokens to generate
+    /// - `sampling_config`: Sampling configuration
+    /// - `eos_token_id`: EOS token ID to stop generation
+    ///
     /// # Returns
     /// Tuple of (tokens, hidden_states)
-    /// - tokens: Vec<u32> - generated zeroth codebook tokens
+    /// - tokens: Vec<u32> - generated zeroth codebook tokens (NOT including codec_bos)
     /// - hidden_states: Tensor [1, num_tokens, hidden_size] - concatenated hidden states
-    #[instrument(skip(self, text_ids, sampling_config))]
+    #[instrument(
+        skip(self, text_ids, sampling_config),
+        fields(max_new_tokens, eos_token_id)
+    )]
     pub fn generate_with_hidden(
         &self,
         text_ids: &[u32],
+        codec_bos_id: u32,
         max_new_tokens: usize,
         sampling_config: SamplingConfig,
         eos_token_id: Option<u32>,
     ) -> Result<(Vec<u32>, Tensor)> {
         info!(
-            "Generating up to {} tokens from {} text tokens (with hidden states)",
+            "Generating up to {} tokens from {} text tokens + codec_bos={} (with hidden states)",
             max_new_tokens,
-            text_ids.len()
+            text_ids.len(),
+            codec_bos_id
         );
 
         let mut sampler = Sampler::new(sampling_config);
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
 
-        // Prefill with text tokens
-        let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, seq_len]
-        let (logits, hidden_states, new_kv_caches) =
+        // Step 1: Prefill with text tokens only (using text_embedding)
+        let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, text_len]
+        let (_, _, text_kv_caches) =
             self.forward_mixed_with_hidden(Some(&text_tensor), None, 0, None)?;
 
-        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(new_kv_caches);
         let mut position_offset = text_ids.len();
 
-        // Sample first codec token from prefill logits
+        // Step 2: Forward codec_bos_id (using codec_embedding) to get first logits
+        let codec_bos_tensor = Tensor::new(&[codec_bos_id], &self.device)?.unsqueeze(0)?;
+        let (logits, hidden_states, new_kv_caches) = self.forward_mixed_with_hidden(
+            None,
+            Some(&codec_bos_tensor),
+            position_offset,
+            Some(&text_kv_caches),
+        )?;
+
+        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(new_kv_caches);
+        position_offset += 1;
+
+        // Sample first codec token from logits after codec_bos
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
         let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
         let mut current_token = sampler.sample(&logits_vec);
 
+        debug!("Step 0: sampled token {} after codec_bos", current_token);
+
         // Check for EOS
         if Some(current_token) == eos_token_id {
-            info!("EOS token generated at prefill");
-            // Return empty hidden states
+            info!("EOS token generated at first step");
             let empty_hidden =
                 Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?;
             return Ok((generated, empty_hidden));
         }
         generated.push(current_token);
 
-        // Store hidden state for this position (last position from prefill)
-        let last_hidden =
-            hidden_states.i((.., hidden_states.dim(1)? - 1..hidden_states.dim(1)?, ..))?;
-        all_hidden_states.push(last_hidden);
+        // Store hidden state for codec_bos position (needed for CodePredictor alignment)
+        all_hidden_states.push(hidden_states.clone());
 
         // Generate remaining tokens
         for step in 1..max_new_tokens {
@@ -442,6 +477,17 @@ impl Model {
 
             // Sample next token
             let next_token = sampler.sample(&logits_vec);
+
+            // Log every 50 steps or when close to EOS
+            if step % 50 == 0 || next_token >= 2145 {
+                info!(
+                    "Step {}: token={}, eos_token={:?}, is_eos={}",
+                    step,
+                    next_token,
+                    eos_token_id,
+                    Some(next_token) == eos_token_id
+                );
+            }
             debug!("Step {}: generated token {}", step, next_token);
 
             // Check for EOS
@@ -470,6 +516,160 @@ impl Model {
         debug!("Hidden states shape: {:?}", concatenated_hidden.dims());
 
         Ok((generated, concatenated_hidden))
+    }
+
+    /// Generate acoustic tokens from combined embeddings (Qwen3-TTS CustomVoice format).
+    ///
+    /// In Qwen3-TTS, the input to the talker is a **sum** of text_embedding and codec_embedding,
+    /// not a concatenation. This method generates from pre-computed combined embeddings.
+    ///
+    /// # Arguments
+    /// - `combined_embeds`: Pre-computed embeddings [1, seq_len, hidden_size] = text_embed + codec_embed
+    /// - `max_new_tokens`: Maximum number of tokens to generate
+    /// - `sampling_config`: Sampling configuration
+    /// - `eos_token_id`: EOS token ID to stop generation
+    ///
+    /// # Returns
+    /// Tuple of (tokens, hidden_states)
+    #[instrument(skip(self, combined_embeds, sampling_config), fields(max_new_tokens))]
+    pub fn generate_from_embeds(
+        &self,
+        combined_embeds: &Tensor,
+        max_new_tokens: usize,
+        sampling_config: SamplingConfig,
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, Tensor)> {
+        let seq_len = combined_embeds.dim(1)?;
+        info!(
+            "Generating up to {} tokens from {} prefill embeddings",
+            max_new_tokens, seq_len
+        );
+
+        let mut sampler = Sampler::new(sampling_config);
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
+
+        // Step 1: Prefill with combined embeddings
+        let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
+
+        let mut position_offset = seq_len;
+        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(kv_caches);
+
+        // Sample first codec token from last position's logits
+        let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
+        let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+        let mut current_token = sampler.sample(&logits_vec);
+
+        debug!("Step 0: sampled token {} from prefill", current_token);
+
+        // Check for EOS
+        if Some(current_token) == eos_token_id {
+            info!("EOS token generated at first step");
+            let empty_hidden =
+                Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?;
+            return Ok((generated, empty_hidden));
+        }
+        generated.push(current_token);
+        all_hidden_states.push(hidden_states.i((.., seq_len - 1.., ..))?.clone());
+
+        // Generate remaining tokens
+        for step in 1..max_new_tokens {
+            // Embed current codec token
+            let codec_tensor = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
+            let codec_embed = self.embed_codec(&codec_tensor)?;
+
+            // Forward pass with codec embedding
+            let (logits, hidden_states, new_kv_caches) =
+                self.forward_embeds(&codec_embed, position_offset, kv_caches.as_deref())?;
+
+            // Store hidden state for this step
+            all_hidden_states.push(hidden_states.clone());
+
+            // Get logits for the last position
+            let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
+            let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+            // Sample next token
+            let next_token = sampler.sample(&logits_vec);
+
+            // Log every 50 steps or when close to EOS
+            if step % 50 == 0 || next_token >= 2145 {
+                info!(
+                    "Step {}: token={}, eos_token={:?}, is_eos={}",
+                    step,
+                    next_token,
+                    eos_token_id,
+                    Some(next_token) == eos_token_id
+                );
+            }
+            debug!("Step {}: generated token {}", step, next_token);
+
+            // Check for EOS
+            if Some(next_token) == eos_token_id {
+                info!("EOS token generated at step {}", step);
+                break;
+            }
+
+            generated.push(next_token);
+
+            // Update for next iteration
+            kv_caches = Some(new_kv_caches);
+            position_offset += 1;
+            current_token = next_token;
+        }
+
+        info!("Generated {} tokens", generated.len());
+
+        // Concatenate all hidden states: [1, num_tokens, hidden_size]
+        let concatenated_hidden = if all_hidden_states.is_empty() {
+            Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?
+        } else {
+            Tensor::cat(&all_hidden_states, 1)?
+        };
+
+        Ok((generated, concatenated_hidden))
+    }
+
+    /// Forward pass from pre-computed embeddings (for CustomVoice flow).
+    ///
+    /// # Returns
+    /// Tuple of (logits, hidden_states, kv_caches)
+    fn forward_embeds(
+        &self,
+        hidden_states: &Tensor,
+        position_offset: usize,
+        kv_caches: Option<&[(Tensor, Tensor)]>,
+    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+        let mut hidden_states = hidden_states.clone();
+        let mut new_kv_caches = Vec::with_capacity(self.layers.len());
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
+
+            let (new_hidden, k_cache, v_cache) =
+                layer.forward(&hidden_states, &self.rotary_emb, position_offset, kv_cache)?;
+
+            hidden_states = new_hidden;
+            new_kv_caches.push((k_cache, v_cache));
+        }
+
+        // Final norm
+        let hidden_states = self.norm.forward(&hidden_states)?;
+
+        // Project to codec vocabulary
+        let logits = self.codec_head.forward(&hidden_states)?;
+
+        Ok((logits, hidden_states, new_kv_caches))
+    }
+
+    /// Get text embedding for given token IDs.
+    pub fn get_text_embedding(&self, text_ids: &Tensor) -> Result<Tensor> {
+        self.embed_text(text_ids)
+    }
+
+    /// Get codec embedding for given token IDs.
+    pub fn get_codec_embedding(&self, codec_ids: &Tensor) -> Result<Tensor> {
+        self.embed_codec(codec_ids)
     }
 }
 

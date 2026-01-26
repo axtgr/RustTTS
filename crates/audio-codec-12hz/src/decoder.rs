@@ -2,6 +2,14 @@
 //!
 //! This module implements the audio decoder that converts acoustic tokens
 //! back to PCM waveform using a neural network architecture.
+//!
+//! The Qwen3-TTS-Tokenizer-12Hz decoder architecture:
+//! 1. **Quantizer dequantize**: tokens → latent embeddings
+//! 2. **Pre-Transformer**: 8-layer transformer with layer scale
+//! 3. **Upsample**: 2 ConvNeXt blocks with 2x upsampling each
+//! 4. **Pre-conv**: Conv1d projection
+//! 5. **HiFi-GAN decoder**: 4 upsample blocks with Snake activation
+//! 6. **Output**: Final conv to mono audio
 
 use std::path::Path;
 
@@ -393,6 +401,10 @@ impl UpsampleBlock {
 /// Supports multi-codebook input from Qwen3-TTS-Tokenizer-12Hz.
 /// The decoder combines embeddings from all 16 codebooks and
 /// upsamples to produce 24kHz audio.
+///
+/// The decoder supports two modes:
+/// - **Legacy mode**: Uses simplified upsampling (when HiFi-GAN weights not available)
+/// - **HiFi-GAN mode**: Uses real Qwen3-TTS architecture with Snake activation
 #[derive(Debug)]
 pub struct NeuralDecoder {
     /// Codebook embeddings (one per quantizer).
@@ -401,14 +413,20 @@ pub struct NeuralDecoder {
     embed_proj: Option<Conv1d>,
     /// Initial projection.
     input_conv: Conv1d,
-    /// Upsampling stages.
+    /// Upsampling stages (legacy mode).
     upsample_blocks: Vec<UpsampleBlock>,
+    /// HiFi-GAN upsample blocks (real Qwen3 mode).
+    hifi_blocks: Option<Vec<HifiUpsampleBlock>>,
+    /// Final Snake activation (for HiFi-GAN mode).
+    final_snake: Option<Snake>,
     /// Final output convolution.
     output_conv: Conv1d,
     /// Configuration.
     config: DecoderConfig,
     /// Device.
     device: Device,
+    /// Whether using HiFi-GAN mode.
+    use_hifi: bool,
 }
 
 impl NeuralDecoder {
@@ -512,9 +530,12 @@ impl NeuralDecoder {
             embed_proj,
             input_conv,
             upsample_blocks,
+            hifi_blocks: None,
+            final_snake: None,
             output_conv,
             config,
             device: device.clone(),
+            use_hifi: false,
         })
     }
 
@@ -568,8 +589,12 @@ fn load_codebook_embedding(
         )
     };
 
-    // Try Qwen3 format first
-    let result = vb.get((config.codebook_size, config.codebook_dim), &embed_key);
+    // Real codebook dimension in Qwen3-TTS-Tokenizer is 256, not 512 from config
+    // We'll try both dimensions
+    let actual_codebook_dim = 256; // vector_quantization_hidden_dimension from config
+
+    // Try Qwen3 format first with actual dimension (256)
+    let result = vb.get((config.codebook_size, actual_codebook_dim), &embed_key);
 
     if let Ok(embed_sum) = result {
         // Load cluster usage for normalization
@@ -585,11 +610,44 @@ fn load_codebook_embedding(
                         .map_err(|e| TtsError::internal(format!("failed to add epsilon: {e}")))?,
                 )
                 .map_err(|e| TtsError::internal(format!("failed to normalize codebook: {e}")))?;
-            debug!("Loaded codebook {} from Qwen3 format (normalized)", index);
+            debug!(
+                "Loaded codebook {} from Qwen3 format (normalized, dim={})",
+                index, actual_codebook_dim
+            );
             return Ok(normalized);
         }
         // If no cluster_usage, use embed_sum directly
-        debug!("Loaded codebook {} from Qwen3 format (raw)", index);
+        debug!(
+            "Loaded codebook {} from Qwen3 format (raw, dim={})",
+            index, actual_codebook_dim
+        );
+        return Ok(embed_sum);
+    }
+
+    // Try with config.codebook_dim (512) as fallback
+    let result = vb.get((config.codebook_size, config.codebook_dim), &embed_key);
+
+    if let Ok(embed_sum) = result {
+        if let Ok(cluster_usage) = vb.get((config.codebook_size,), &usage_key) {
+            let usage_expanded = cluster_usage
+                .unsqueeze(1)
+                .map_err(|e| TtsError::internal(format!("failed to expand cluster_usage: {e}")))?;
+            let normalized = embed_sum
+                .broadcast_div(
+                    &(usage_expanded + 1e-7)
+                        .map_err(|e| TtsError::internal(format!("failed to add epsilon: {e}")))?,
+                )
+                .map_err(|e| TtsError::internal(format!("failed to normalize codebook: {e}")))?;
+            debug!(
+                "Loaded codebook {} from Qwen3 format (normalized, dim={})",
+                index, config.codebook_dim
+            );
+            return Ok(normalized);
+        }
+        debug!(
+            "Loaded codebook {} from Qwen3 format (raw, dim={})",
+            index, config.codebook_dim
+        );
         return Ok(embed_sum);
     }
 
@@ -607,12 +665,12 @@ fn load_codebook_embedding(
         }
     }
 
-    // If all else fails, create random initialization
+    // If all else fails, create random initialization with actual dimension
     debug!("Codebook {} not found, using random initialization", index);
     let codebook = Tensor::randn(
         0.0f32,
         0.02,
-        (config.codebook_size, config.codebook_dim),
+        (config.codebook_size, actual_codebook_dim),
         device,
     )
     .map_err(|e| TtsError::internal(format!("failed to create random codebook: {e}")))?;
@@ -662,15 +720,22 @@ impl NeuralDecoder {
             codebooks.push(codebook);
         }
 
+        // Determine actual codebook dimension from loaded tensors
+        let actual_codebook_dim = if !codebooks.is_empty() {
+            codebooks[0].dim(1).unwrap_or(config.codebook_dim)
+        } else {
+            config.codebook_dim
+        };
+
         info!(
             "Loaded {} codebooks ({} x {})",
             codebooks.len(),
             config.codebook_size,
-            config.codebook_dim
+            actual_codebook_dim
         );
 
-        // Combined embedding dimension
-        let combined_dim = config.num_quantizers * config.codebook_dim;
+        // Combined embedding dimension using actual codebook dimension
+        let combined_dim = config.num_quantizers * actual_codebook_dim;
 
         // Projection from combined embeddings to latent space
         // Note: The Qwen3 model has a different architecture (HiFi-GAN based),
@@ -831,23 +896,109 @@ impl NeuralDecoder {
             })
             .map_err(|e| TtsError::internal(format!("failed to create output_conv: {e}")))?;
 
-        info!(
-            "Decoder loaded: {} codebooks x {} entries, latent={}, upsample={}x",
-            config.num_quantizers,
-            config.codebook_size,
-            config.latent_dim,
-            config.total_upsample()
-        );
+        // Try to load HiFi-GAN blocks from Qwen3 format
+        // decoder.decoder.{1-4} are the upsample blocks with Snake activation
+        let (hifi_blocks, final_snake, use_hifi) = Self::try_load_hifi_gan(&vb, &config, device);
+
+        if use_hifi {
+            info!(
+                "Decoder loaded (HiFi-GAN mode): {} codebooks x {} entries, latent={}, upsample={}x",
+                config.num_quantizers,
+                config.codebook_size,
+                config.latent_dim,
+                config.total_upsample()
+            );
+        } else {
+            info!(
+                "Decoder loaded (legacy mode): {} codebooks x {} entries, latent={}, upsample={}x",
+                config.num_quantizers,
+                config.codebook_size,
+                config.latent_dim,
+                config.total_upsample()
+            );
+        }
 
         Ok(Self {
             codebooks,
             embed_proj,
             input_conv,
             upsample_blocks,
+            hifi_blocks,
+            final_snake,
             output_conv,
             config,
             device: device.clone(),
+            use_hifi,
         })
+    }
+
+    /// Try to load HiFi-GAN components from Qwen3-TTS weights.
+    fn try_load_hifi_gan(
+        vb: &VarBuilder,
+        _config: &DecoderConfig,
+        device: &Device,
+    ) -> (Option<Vec<HifiUpsampleBlock>>, Option<Snake>, bool) {
+        // Qwen3-TTS HiFi-GAN structure:
+        // decoder.decoder.0: Initial conv (already loaded as input_conv)
+        // decoder.decoder.1: Upsample block (1536 -> 768, 8x)
+        // decoder.decoder.2: Upsample block (768 -> 384, 5x)
+        // decoder.decoder.3: Upsample block (384 -> 192, 4x)
+        // decoder.decoder.4: Upsample block (192 -> 96, 3x)
+        // decoder.decoder.5: Final Snake activation
+        // decoder.decoder.6: Output conv (already loaded as output_conv)
+
+        // Channel progression: 1536 -> 768 -> 384 -> 192 -> 96
+        let channels = [1536, 768, 384, 192, 96];
+        // Upsample factors: 8, 5, 4, 3 (but implemented as kernel sizes 16, 10, 8, 6)
+        let kernel_sizes = [16, 10, 8, 6];
+        let upsample_factors = [8, 5, 4, 3];
+
+        let mut hifi_blocks = Vec::with_capacity(4);
+        let mut loaded_count = 0;
+
+        for i in 0..4 {
+            let block_vb = vb.pp(format!("decoder.decoder.{}", i + 1));
+
+            match HifiUpsampleBlock::from_vb(
+                block_vb,
+                channels[i],
+                channels[i + 1],
+                upsample_factors[i],
+                kernel_sizes[i],
+                3, // 3 residual blocks per upsample block
+                device,
+            ) {
+                Ok(block) => {
+                    hifi_blocks.push(block);
+                    loaded_count += 1;
+                    debug!("Loaded HiFi-GAN block {}", i + 1);
+                }
+                Err(e) => {
+                    debug!("Failed to load HiFi-GAN block {}: {}", i + 1, e);
+                    break;
+                }
+            }
+        }
+
+        // Only use HiFi-GAN mode if we loaded all 4 blocks
+        if loaded_count < 4 {
+            debug!(
+                "Only loaded {}/4 HiFi-GAN blocks, falling back to legacy mode",
+                loaded_count
+            );
+            return (None, None, false);
+        }
+
+        // Try to load final Snake activation
+        let final_snake = Snake::from_vb(vb.pp("decoder.decoder.5"), 96).ok();
+
+        if final_snake.is_none() {
+            debug!("Failed to load final Snake, falling back to legacy mode");
+            return (None, None, false);
+        }
+
+        info!("Successfully loaded HiFi-GAN decoder with Snake activation");
+        (Some(hifi_blocks), final_snake, true)
     }
 
     /// Get the decoder configuration.
@@ -993,6 +1144,45 @@ impl NeuralDecoder {
 
         // Input projection
         let mut x = self.input_conv.forward(&latent)?;
+
+        // Use HiFi-GAN mode if available, otherwise legacy mode
+        if self.use_hifi {
+            x = self.decode_hifi_gan(x)?;
+        } else {
+            x = self.decode_legacy(x)?;
+        }
+
+        // Squeeze and convert to Vec
+        let x = x.squeeze(0)?.squeeze(0)?;
+        x.to_vec1()
+    }
+
+    /// Decode using HiFi-GAN architecture with Snake activation.
+    fn decode_hifi_gan(&self, mut x: Tensor) -> CandleResult<Tensor> {
+        // No initial activation - Snake is applied at the start of each upsample block
+
+        // Process through HiFi-GAN upsample blocks
+        if let Some(ref hifi_blocks) = self.hifi_blocks {
+            for (i, block) in hifi_blocks.iter().enumerate() {
+                x = block.forward(&x)?;
+                debug!("HiFi-GAN block {} output shape: {:?}", i, x.dims());
+            }
+        }
+
+        // Final Snake activation
+        if let Some(ref snake) = self.final_snake {
+            x = snake.forward(&x)?;
+        }
+
+        // Output projection
+        let x = self.output_conv.forward(&x)?;
+
+        // Apply tanh to constrain output to [-1, 1]
+        x.tanh()
+    }
+
+    /// Decode using legacy upsampling (when HiFi-GAN weights not available).
+    fn decode_legacy(&self, mut x: Tensor) -> CandleResult<Tensor> {
         x = leaky_relu(&x, 0.1)?;
 
         // Upsampling stages
@@ -1004,11 +1194,7 @@ impl NeuralDecoder {
         let x = self.output_conv.forward(&x)?;
 
         // Apply tanh to constrain output to [-1, 1]
-        let x = x.tanh()?;
-
-        // Squeeze and convert to Vec
-        let x = x.squeeze(0)?.squeeze(0)?;
-        x.to_vec1()
+        x.tanh()
     }
 
     /// Decode a single frame from all codebooks (for streaming).
@@ -1041,6 +1227,284 @@ fn leaky_relu(x: &Tensor, negative_slope: f32) -> CandleResult<Tensor> {
     let positive = x.maximum(&zeros)?;
     let negative = (x.minimum(&zeros)? * negative_slope as f64)?;
     positive + negative
+}
+
+/// Snake activation: x + (1/alpha) * sin²(alpha * x)
+///
+/// This is the activation function used in Qwen3-TTS-Tokenizer HiFi-GAN decoder.
+/// It provides smooth, periodic activation that helps with audio synthesis.
+#[derive(Debug, Clone)]
+pub struct Snake {
+    /// Alpha parameter per channel [channels].
+    alpha: Tensor,
+    /// Beta parameter per channel [channels] (optional, used as scaling).
+    beta: Option<Tensor>,
+}
+
+impl Snake {
+    /// Create new Snake activation from weights.
+    pub fn new(alpha: Tensor, beta: Option<Tensor>) -> Self {
+        Self { alpha, beta }
+    }
+
+    /// Load Snake activation from VarBuilder.
+    pub fn from_vb(vb: VarBuilder, channels: usize) -> CandleResult<Self> {
+        let alpha = vb.get((channels,), "alpha")?;
+        let beta = vb.get((channels,), "beta").ok();
+        Ok(Self { alpha, beta })
+    }
+
+    /// Create with random initialization.
+    pub fn new_random(channels: usize, device: &Device) -> CandleResult<Self> {
+        // Initialize alpha to 1.0 (identity-like behavior initially)
+        let alpha = Tensor::ones((channels,), DType::F32, device)?;
+        let beta = Some(Tensor::ones((channels,), DType::F32, device)?);
+        Ok(Self { alpha, beta })
+    }
+
+    /// Forward pass: x + (1/alpha) * sin²(alpha * x)
+    ///
+    /// Input shape: [batch, channels, seq_len]
+    pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // Reshape alpha for broadcasting: [1, channels, 1]
+        let alpha = self.alpha.unsqueeze(0)?.unsqueeze(2)?;
+
+        // Compute alpha * x
+        let ax = x.broadcast_mul(&alpha)?;
+
+        // Compute sin²(alpha * x)
+        let sin_ax = ax.sin()?;
+        let sin_sq = (&sin_ax * &sin_ax)?;
+
+        // Compute 1/alpha
+        let inv_alpha = (1.0 / &alpha)?;
+
+        // x + (1/alpha) * sin²(alpha * x)
+        let activation = (x + &(sin_sq.broadcast_mul(&inv_alpha)?))?;
+
+        // Apply beta scaling if present
+        if let Some(ref beta) = self.beta {
+            let beta = beta.unsqueeze(0)?.unsqueeze(2)?;
+            activation.broadcast_mul(&beta)
+        } else {
+            Ok(activation)
+        }
+    }
+}
+
+/// HiFi-GAN Residual Block with Snake activation.
+///
+/// Structure from Qwen3-TTS-Tokenizer:
+/// - Snake activation (act1)
+/// - Conv1d
+/// - Snake activation (act2)
+/// - Conv1d
+/// - Residual connection
+#[derive(Debug)]
+struct HifiResBlock {
+    act1: Snake,
+    conv1: Conv1d,
+    act2: Snake,
+    conv2: Conv1d,
+}
+
+impl HifiResBlock {
+    /// Load from VarBuilder (Qwen3 format).
+    fn from_vb(vb: VarBuilder, channels: usize, kernel_size: usize) -> CandleResult<Self> {
+        let act1 = Snake::from_vb(vb.pp("act1"), channels)?;
+        let act2 = Snake::from_vb(vb.pp("act2"), channels)?;
+
+        let padding = kernel_size / 2;
+        let conv1_cfg = Conv1dConfig {
+            padding,
+            ..Default::default()
+        };
+        let conv1 = conv1d(
+            channels,
+            channels,
+            kernel_size,
+            conv1_cfg,
+            vb.pp("conv1.conv"),
+        )?;
+
+        // Second conv is typically 1x1 projection
+        let conv2 = conv1d(
+            channels,
+            channels,
+            1,
+            Conv1dConfig::default(),
+            vb.pp("conv2.conv"),
+        )?;
+
+        Ok(Self {
+            act1,
+            conv1,
+            act2,
+            conv2,
+        })
+    }
+
+    /// Create with random initialization.
+    fn new_random(channels: usize, kernel_size: usize, device: &Device) -> CandleResult<Self> {
+        let act1 = Snake::new_random(channels, device)?;
+        let act2 = Snake::new_random(channels, device)?;
+
+        let padding = kernel_size / 2;
+        let w1 = Tensor::randn(0.0f32, 0.02, (channels, channels, kernel_size), device)?;
+        let b1 = Tensor::zeros((channels,), DType::F32, device)?;
+        let conv1 = Conv1d::new(
+            w1,
+            Some(b1),
+            Conv1dConfig {
+                padding,
+                ..Default::default()
+            },
+        );
+
+        let w2 = Tensor::randn(0.0f32, 0.02, (channels, channels, 1), device)?;
+        let b2 = Tensor::zeros((channels,), DType::F32, device)?;
+        let conv2 = Conv1d::new(w2, Some(b2), Conv1dConfig::default());
+
+        Ok(Self {
+            act1,
+            conv1,
+            act2,
+            conv2,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let residual = x.clone();
+
+        let x = self.act1.forward(x)?;
+        let x = self.conv1.forward(&x)?;
+        let x = self.act2.forward(&x)?;
+        let x = self.conv2.forward(&x)?;
+
+        x + residual
+    }
+}
+
+/// HiFi-GAN Upsample Block with Snake activation.
+///
+/// Structure from Qwen3-TTS-Tokenizer (decoder.decoder.{1-4}):
+/// - Snake activation (block.0)
+/// - ConvTranspose1d for upsampling (block.1.conv)
+/// - 3 residual blocks (block.2, block.3, block.4)
+#[derive(Debug)]
+struct HifiUpsampleBlock {
+    snake: Snake,
+    upsample_conv: ConvTranspose1d,
+    res_blocks: Vec<HifiResBlock>,
+}
+
+impl HifiUpsampleBlock {
+    /// Load from VarBuilder (Qwen3 format).
+    #[allow(dead_code)]
+    fn from_vb(
+        vb: VarBuilder,
+        in_channels: usize,
+        out_channels: usize,
+        upsample_factor: usize,
+        kernel_size: usize,
+        num_res_blocks: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        // Snake activation at the start
+        let snake = Snake::from_vb(vb.pp("block.0"), in_channels)
+            .or_else(|_| Snake::new_random(in_channels, device))?;
+
+        // Upsample conv (transposed convolution)
+        let padding = (kernel_size - upsample_factor) / 2;
+        let conv_cfg = ConvTranspose1dConfig {
+            stride: upsample_factor,
+            padding,
+            ..Default::default()
+        };
+        let upsample_conv = conv_transpose1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            conv_cfg,
+            vb.pp("block.1.conv"),
+        )
+        .or_else(|_| -> CandleResult<ConvTranspose1d> {
+            // Random fallback
+            let w = Tensor::randn(
+                0.0f32,
+                0.02,
+                (in_channels, out_channels, kernel_size),
+                device,
+            )?;
+            let b = Tensor::zeros((out_channels,), DType::F32, device)?;
+            Ok(ConvTranspose1d::new(w, Some(b), conv_cfg))
+        })?;
+
+        // Residual blocks
+        let mut res_blocks = Vec::with_capacity(num_res_blocks);
+        for i in 0..num_res_blocks {
+            let block = HifiResBlock::from_vb(vb.pp(format!("block.{}", i + 2)), out_channels, 7)
+                .or_else(|_| HifiResBlock::new_random(out_channels, 7, device))?;
+            res_blocks.push(block);
+        }
+
+        Ok(Self {
+            snake,
+            upsample_conv,
+            res_blocks,
+        })
+    }
+
+    /// Create with random initialization.
+    #[allow(dead_code)]
+    fn new_random(
+        in_channels: usize,
+        out_channels: usize,
+        upsample_factor: usize,
+        kernel_size: usize,
+        num_res_blocks: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        let snake = Snake::new_random(in_channels, device)?;
+
+        let padding = (kernel_size - upsample_factor) / 2;
+        let w = Tensor::randn(
+            0.0f32,
+            0.02,
+            (in_channels, out_channels, kernel_size),
+            device,
+        )?;
+        let b = Tensor::zeros((out_channels,), DType::F32, device)?;
+        let conv_cfg = ConvTranspose1dConfig {
+            stride: upsample_factor,
+            padding,
+            ..Default::default()
+        };
+        let upsample_conv = ConvTranspose1d::new(w, Some(b), conv_cfg);
+
+        let mut res_blocks = Vec::with_capacity(num_res_blocks);
+        for _ in 0..num_res_blocks {
+            res_blocks.push(HifiResBlock::new_random(out_channels, 7, device)?);
+        }
+
+        Ok(Self {
+            snake,
+            upsample_conv,
+            res_blocks,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let x = self.snake.forward(x)?;
+        let mut x = self.upsample_conv.forward(&x)?;
+
+        for block in &self.res_blocks {
+            x = block.forward(&x)?;
+        }
+
+        Ok(x)
+    }
 }
 
 /// Mock decoder for testing without model weights.

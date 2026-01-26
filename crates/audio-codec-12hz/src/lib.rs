@@ -35,6 +35,7 @@ pub const DEFAULT_CROSSFADE_MS: f32 = 5.0;
 
 /// Decoder backend selection.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DecoderBackend {
     /// Neural network decoder (requires weights).
     Neural(NeuralDecoder),

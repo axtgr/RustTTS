@@ -28,7 +28,7 @@ use tracing::{info, instrument};
 use tts_core::{NormText, TextTokenizer, TokenSeq, TtsError, TtsResult};
 
 /// Qwen3-TTS specific special token IDs (from config.json).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Qwen3TTSTokens {
     /// TTS begin-of-sequence token ID (151672).
     pub tts_bos_token_id: u32,
@@ -42,6 +42,104 @@ pub struct Qwen3TTSTokens {
     pub codec_eos_id: u32,
     /// Codec padding token ID (2148).
     pub codec_pad_id: u32,
+    /// Codec "think" token ID (2154) - marks thinking mode.
+    pub codec_think_id: u32,
+    /// Codec "no-think" token ID (2155).
+    pub codec_nothink_id: u32,
+    /// Codec think BOS token ID (2156).
+    pub codec_think_bos_id: u32,
+    /// Codec think EOS token ID (2157).
+    pub codec_think_eos_id: u32,
+    /// Speaker token IDs for CustomVoice models.
+    pub speaker_ids: SpeakerIds,
+    /// Language token IDs.
+    pub language_ids: LanguageIds,
+    // ChatML tokens for prompt formatting
+    /// ChatML im_start token ID (151644).
+    pub im_start_token_id: u32,
+    /// ChatML im_end token ID (151645).
+    pub im_end_token_id: u32,
+    /// "assistant" token ID (77091).
+    pub assistant_token_id: u32,
+    /// Newline token ID (198) - byte-level BPE for '\n'.
+    pub newline_token_id: u32,
+}
+
+/// Speaker token IDs for CustomVoice models.
+#[derive(Debug, Clone, Default)]
+pub struct SpeakerIds {
+    pub serena: u32,
+    pub vivian: u32,
+    pub uncle_fu: u32,
+    pub ryan: u32,
+    pub aiden: u32,
+    pub ono_anna: u32,
+    pub sohee: u32,
+    pub eric: u32,
+    pub dylan: u32,
+}
+
+impl SpeakerIds {
+    /// Get speaker token ID by name (case-insensitive).
+    pub fn by_name(&self, name: &str) -> Option<u32> {
+        match name.to_lowercase().as_str() {
+            "serena" => Some(self.serena),
+            "vivian" => Some(self.vivian),
+            "uncle_fu" | "unclefu" => Some(self.uncle_fu),
+            "ryan" => Some(self.ryan),
+            "aiden" => Some(self.aiden),
+            "ono_anna" | "onoanna" => Some(self.ono_anna),
+            "sohee" => Some(self.sohee),
+            "eric" => Some(self.eric),
+            "dylan" => Some(self.dylan),
+            _ => None,
+        }
+    }
+
+    /// List all available speaker names.
+    pub fn available_speakers() -> &'static [&'static str] {
+        &[
+            "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
+        ]
+    }
+}
+
+/// Language token IDs.
+#[derive(Debug, Clone, Default)]
+pub struct LanguageIds {
+    pub chinese: u32,
+    pub english: u32,
+    pub german: u32,
+    pub italian: u32,
+    pub portuguese: u32,
+    pub spanish: u32,
+    pub japanese: u32,
+    pub korean: u32,
+    pub french: u32,
+    pub russian: u32,
+    pub beijing_dialect: u32,
+    pub sichuan_dialect: u32,
+}
+
+impl LanguageIds {
+    /// Get language token ID by name (case-insensitive).
+    pub fn by_name(&self, name: &str) -> Option<u32> {
+        match name.to_lowercase().as_str() {
+            "chinese" | "zh" => Some(self.chinese),
+            "english" | "en" => Some(self.english),
+            "german" | "de" => Some(self.german),
+            "italian" | "it" => Some(self.italian),
+            "portuguese" | "pt" => Some(self.portuguese),
+            "spanish" | "es" => Some(self.spanish),
+            "japanese" | "ja" => Some(self.japanese),
+            "korean" | "ko" => Some(self.korean),
+            "french" | "fr" => Some(self.french),
+            "russian" | "ru" => Some(self.russian),
+            "beijing_dialect" => Some(self.beijing_dialect),
+            "sichuan_dialect" => Some(self.sichuan_dialect),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Qwen3TTSTokens {
@@ -53,6 +151,40 @@ impl Default for Qwen3TTSTokens {
             codec_bos_id: 2149,
             codec_eos_id: 2150,
             codec_pad_id: 2148,
+            codec_think_id: 2154,
+            codec_nothink_id: 2155,
+            codec_think_bos_id: 2156,
+            codec_think_eos_id: 2157,
+            speaker_ids: SpeakerIds {
+                serena: 3066,
+                vivian: 3065,
+                uncle_fu: 3010,
+                ryan: 3061,
+                aiden: 2861,
+                ono_anna: 2873,
+                sohee: 2864,
+                eric: 2875,
+                dylan: 2878,
+            },
+            language_ids: LanguageIds {
+                chinese: 2055,
+                english: 2050,
+                german: 2053,
+                italian: 2070,
+                portuguese: 2071,
+                spanish: 2054,
+                japanese: 2058,
+                korean: 2064,
+                french: 2061,
+                russian: 2069,
+                beijing_dialect: 2074,
+                sichuan_dialect: 2062,
+            },
+            // ChatML tokens
+            im_start_token_id: 151644,
+            im_end_token_id: 151645,
+            assistant_token_id: 77091,
+            newline_token_id: 198,
         }
     }
 }

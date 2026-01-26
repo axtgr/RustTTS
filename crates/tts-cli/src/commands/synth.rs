@@ -16,7 +16,8 @@ pub struct SynthOptions {
     pub input: String,
     pub output: PathBuf,
     pub lang: String,
-    pub speaker: Option<u32>,
+    /// Speaker name for CustomVoice models (e.g., "vivian", "ryan").
+    pub speaker: Option<String>,
     pub model_dir: Option<PathBuf>,
     pub codec_dir: Option<PathBuf>,
     /// Legacy model config path (reserved for future use).
@@ -93,9 +94,9 @@ pub async fn run(options: SynthOptions) -> Result<()> {
     // Create pipeline
     let pipeline = create_pipeline(&options)?;
 
-    // Synthesize
+    // Synthesize (with optional speaker for CustomVoice models)
     let synth_start = Instant::now();
-    let audio = pipeline.synthesize(&text, Some(lang))?;
+    let audio = pipeline.synthesize_with_speaker(&text, Some(lang), options.speaker.as_deref())?;
     let synth_duration = synth_start.elapsed();
 
     debug!(

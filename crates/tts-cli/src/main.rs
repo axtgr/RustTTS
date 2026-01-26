@@ -45,9 +45,10 @@ enum Commands {
         #[arg(long, default_value = "ru")]
         lang: String,
 
-        /// Speaker ID (if model supports multiple speakers)
+        /// Speaker name for CustomVoice models (e.g., vivian, ryan, serena)
+        /// Available: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan
         #[arg(short, long)]
-        speaker: Option<u32>,
+        speaker: Option<String>,
 
         /// Path to pretrained model directory (e.g., models/qwen3-tts-0.6b)
         #[arg(long)]

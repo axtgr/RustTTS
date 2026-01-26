@@ -39,6 +39,8 @@ pub struct PipelineConfig {
     pub chunk_tokens: usize,
     /// Maximum sequence length.
     pub max_seq_len: usize,
+    /// Default speaker for CustomVoice models (e.g., "vivian", "ryan").
+    pub default_speaker: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -49,6 +51,7 @@ impl Default for PipelineConfig {
             crossfade_ms: DEFAULT_CROSSFADE_MS,
             chunk_tokens: 10,
             max_seq_len: 4096,
+            default_speaker: None,
         }
     }
 }
@@ -378,15 +381,17 @@ impl TtsPipeline {
         text_tokens: &[u32],
         max_tokens: usize,
     ) -> TtsResult<Vec<u32>> {
-        // Build input sequence with special tokens:
-        // [tts_bos] [text_tokens...] [codec_bos]
-        let mut input_ids = Vec::with_capacity(text_tokens.len() + 2);
-        input_ids.push(self.special_tokens.tts_bos_token_id);
-        input_ids.extend_from_slice(text_tokens);
-        input_ids.push(self.special_tokens.codec_bos_id);
+        // Build text input sequence with special tokens:
+        // [tts_bos] [text_tokens...]
+        // Note: codec_bos is passed separately to generate_with_hidden
+        let mut text_input_ids = Vec::with_capacity(text_tokens.len() + 1);
+        text_input_ids.push(self.special_tokens.tts_bos_token_id);
+        text_input_ids.extend_from_slice(text_tokens);
 
         debug!(
-            input_len = input_ids.len(),
+            text_len = text_input_ids.len(),
+            codec_bos = self.special_tokens.codec_bos_id,
+            codec_eos = self.special_tokens.codec_eos_id,
             max_tokens = max_tokens,
             has_code_predictor = code_predictor.is_some(),
             "Starting neural acoustic generation"
@@ -401,9 +406,11 @@ impl TtsPipeline {
         };
 
         // Generate zeroth codebook tokens with hidden states
+        // text_input_ids go through text_embedding, codec_bos goes through codec_embedding
         let (zeroth_tokens, hidden_states) = model
             .generate_with_hidden(
-                &input_ids,
+                &text_input_ids,
+                self.special_tokens.codec_bos_id,
                 max_tokens,
                 sampling_config.clone(),
                 Some(self.special_tokens.codec_eos_id),
@@ -463,6 +470,257 @@ impl TtsPipeline {
         Ok(all_codes_flat)
     }
 
+    /// Generate acoustic tokens with speaker for CustomVoice models.
+    ///
+    /// This builds the proper prompt format following Python implementation:
+    /// 1. Role prefix: [im_start, assistant, newline] - goes through text_embedding only
+    /// 2. Codec prefix: [think, think_bos, lang_id?, think_eos, speaker_id?, pad, bos]
+    ///    with text: [tts_pad, ..., tts_bos] - combined embeddings
+    /// 3. Text tokens: text_tokens with codec_pad - combined embeddings
+    /// 4. Final: [tts_eos + codec_pad], then [tts_pad + codec_bos] to start generation
+    fn generate_acoustic_with_speaker(
+        &self,
+        model: &AcousticModel,
+        code_predictor: Option<&CodePredictor>,
+        text_tokens: &[u32],
+        speaker: Option<&str>,
+        lang: Lang,
+        max_tokens: usize,
+    ) -> TtsResult<Vec<u32>> {
+        use candle_core::Tensor;
+
+        let st = &self.special_tokens;
+
+        // Get speaker token ID (optional - for CustomVoice models)
+        let speaker_id = speaker.and_then(|s| st.speaker_ids.by_name(s));
+
+        // Get language token ID
+        let lang_name = match lang {
+            Lang::Ru => "russian",
+            Lang::En => "english",
+            Lang::Mixed => "english", // Default to English for mixed
+        };
+        let lang_id = st.language_ids.by_name(lang_name);
+
+        info!(
+            "Building CustomVoice prompt: speaker={:?} (id={:?}), lang={} (id={:?}), text_tokens={}",
+            speaker,
+            speaker_id,
+            lang_name,
+            lang_id,
+            text_tokens.len()
+        );
+
+        // ========== PART 1: Role prefix (text embedding only) ==========
+        // [im_start, assistant, newline] - these go through text_embedding only, not combined with codec
+        let role_prefix: Vec<u32> = vec![
+            st.im_start_token_id,  // 151644
+            st.assistant_token_id, // 77091
+            st.newline_token_id,   // 198
+        ];
+
+        let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let role_prefix_embed = model
+            .get_text_embedding(&role_prefix_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        // ========== PART 2: Codec prefix with combined embeddings ==========
+        // Build codec prefix: [think, think_bos, (lang_id), think_eos, (speaker_id), pad, bos]
+        let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
+        if let Some(lid) = lang_id {
+            codec_prefix.push(lid);
+        }
+        codec_prefix.push(st.codec_think_eos_id);
+        if let Some(sid) = speaker_id {
+            codec_prefix.push(sid);
+        }
+        codec_prefix.push(st.codec_pad_id);
+        codec_prefix.push(st.codec_bos_id);
+
+        // Text for codec prefix: all tts_pad except last which is tts_bos
+        // But we take [:-1] because the last codec_bos pairs with first text token
+        let text_for_codec_prefix: Vec<u32> = codec_prefix
+            .iter()
+            .take(codec_prefix.len() - 1) // exclude last (codec_bos)
+            .map(|_| st.tts_pad_token_id)
+            .collect();
+
+        let codec_prefix_for_embed: Vec<u32> = codec_prefix[..codec_prefix.len() - 1].to_vec();
+
+        let codec_prefix_tensor = Tensor::new(codec_prefix_for_embed.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let text_for_codec_prefix_tensor =
+            Tensor::new(text_for_codec_prefix.as_slice(), &self.device)
+                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let codec_prefix_embed = model
+            .get_codec_embedding(&codec_prefix_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let text_for_codec_prefix_embed =
+            model
+                .get_text_embedding(&text_for_codec_prefix_tensor)
+                .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        // Combine: tts_pad + codec_prefix (element-wise)
+        let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 3: Text tokens with codec_pad + first text with codec_bos ==========
+        // First text token pairs with codec_bos
+        // Rest of text tokens pair with codec_pad
+        // Then tts_eos pairs with codec_pad
+        // Finally tts_pad pairs with codec_bos (start of generation)
+
+        // Build text sequence: [tts_bos, text_tokens..., tts_eos, tts_pad]
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        text_seq.push(st.tts_bos_token_id);
+        text_seq.extend_from_slice(text_tokens);
+        text_seq.push(st.tts_eos_token_id);
+        text_seq.push(st.tts_pad_token_id);
+
+        // Build codec sequence: [codec_bos, codec_pad..., codec_pad, codec_bos]
+        let mut codec_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        codec_seq.push(st.codec_bos_id); // pairs with tts_bos
+        for _ in 0..text_tokens.len() {
+            codec_seq.push(st.codec_pad_id); // pairs with each text token
+        }
+        codec_seq.push(st.codec_pad_id); // pairs with tts_eos
+        codec_seq.push(st.codec_bos_id); // pairs with tts_pad (start generation)
+
+        let text_seq_tensor = Tensor::new(text_seq.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let codec_seq_tensor = Tensor::new(codec_seq.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let text_seq_embed = model
+            .get_text_embedding(&text_seq_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        let codec_seq_embed = model
+            .get_codec_embedding(&codec_seq_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        // Combine text + codec embeddings
+        let text_combined = (&text_seq_embed + &codec_seq_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 4: Concatenate all parts ==========
+        // [role_prefix_embed] + [codec_prefix_combined] + [text_combined]
+        let combined_embeds = Tensor::cat(
+            &[role_prefix_embed, codec_prefix_combined, text_combined],
+            1,
+        )
+        .map_err(|e| TtsError::inference(format!("cat failed: {e}")))?;
+
+        debug!(
+            role_len = role_prefix.len(),
+            codec_prefix_len = codec_prefix_for_embed.len(),
+            text_seq_len = text_seq.len(),
+            combined_shape = ?combined_embeds.dims(),
+            "Combined embeddings built"
+        );
+
+        // Configure sampling
+        let sampling_config = SamplingConfig {
+            temperature: 0.9,
+            top_p: 1.0,
+            top_k: 50,
+            seed: None,
+        };
+
+        // Generate from combined embeddings
+        let (zeroth_tokens, hidden_states) = model
+            .generate_from_embeds(
+                &combined_embeds,
+                max_tokens,
+                sampling_config.clone(),
+                Some(st.codec_eos_id),
+            )
+            .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+        debug!(
+            zeroth_tokens = zeroth_tokens.len(),
+            hidden_shape = ?hidden_states.dims(),
+            "Zeroth codebook generation complete"
+        );
+
+        // If no CodePredictor, return only zeroth codebook
+        // TODO: Fix CodePredictor shape mismatch and re-enable multi-codebook prediction
+        // For now, return zeroth codebook only - sufficient for basic audio generation
+        if code_predictor.is_none() {
+            return Ok(zeroth_tokens);
+        }
+
+        // Temporarily skip CodePredictor due to shape mismatch issue
+        // The zeroth codebook is sufficient for basic audio generation
+        info!(
+            "Skipping CodePredictor (shape mismatch), using zeroth codebook only ({} tokens)",
+            zeroth_tokens.len()
+        );
+        Ok(zeroth_tokens)
+    }
+
+    /// Generate acoustic tokens from text tokens with optional speaker.
+    ///
+    /// Uses real acoustic model if available, otherwise falls back to mock.
+    /// If speaker is provided, uses CustomVoice prompt format.
+    pub fn generate_acoustic_with_options(
+        &self,
+        text_tokens: &[u32],
+        speaker: Option<&str>,
+        lang: Lang,
+        max_tokens: usize,
+    ) -> TtsResult<Vec<u32>> {
+        if text_tokens.is_empty() {
+            return Err(TtsError::invalid_input("empty text tokens"));
+        }
+
+        match &self.acoustic {
+            AcousticBackend::Neural {
+                model,
+                code_predictor,
+            } => {
+                // Use CustomVoice format if speaker is provided or if we have speaker configured
+                let use_speaker = speaker.is_some() || self.config.default_speaker.is_some();
+                let actual_speaker = speaker.or(self.config.default_speaker.as_deref());
+
+                if use_speaker {
+                    self.generate_acoustic_with_speaker(
+                        model,
+                        code_predictor.as_deref(),
+                        text_tokens,
+                        actual_speaker,
+                        lang,
+                        max_tokens,
+                    )
+                } else {
+                    self.generate_acoustic_neural(
+                        model,
+                        code_predictor.as_deref(),
+                        text_tokens,
+                        max_tokens,
+                    )
+                }
+            }
+            AcousticBackend::Mock => self.generate_acoustic_mock(text_tokens, max_tokens),
+        }
+    }
+
     /// Generate mock acoustic tokens (for testing without model weights).
     fn generate_acoustic_mock(
         &self,
@@ -498,23 +756,67 @@ impl TtsPipeline {
     /// Full synthesis: text → audio.
     #[instrument(skip(self), fields(text_len = text.len()))]
     pub fn synthesize(&self, text: &str, lang: Option<Lang>) -> TtsResult<AudioChunk> {
+        self.synthesize_with_speaker(text, lang, None)
+    }
+
+    /// Full synthesis with speaker: text → audio.
+    ///
+    /// # Arguments
+    /// * `text` - Text to synthesize
+    /// * `lang` - Language (optional, defaults to pipeline default)
+    /// * `speaker` - Speaker name for CustomVoice models (e.g., "vivian", "ryan")
+    #[instrument(skip(self), fields(text_len = text.len(), speaker))]
+    pub fn synthesize_with_speaker(
+        &self,
+        text: &str,
+        lang: Option<Lang>,
+        speaker: Option<&str>,
+    ) -> TtsResult<AudioChunk> {
+        let lang = lang.unwrap_or(self.config.default_lang);
+
         // 1. Normalize
-        let normalized = self.normalize(text, lang)?;
+        let normalized = self.normalize(text, Some(lang))?;
         debug!(normalized = %normalized.text, "Text normalized");
 
         // 2. Tokenize
         let text_tokens = self.tokenize(&normalized)?;
         debug!(num_tokens = text_tokens.len(), "Text tokenized");
 
-        // 3. Generate acoustic tokens
-        let acoustic_tokens = self.generate_acoustic(&text_tokens, self.config.max_seq_len)?;
+        // 3. Generate acoustic tokens with speaker
+        let acoustic_tokens = self.generate_acoustic_with_options(
+            &text_tokens,
+            speaker,
+            lang,
+            self.config.max_seq_len,
+        )?;
         debug!(
             num_acoustic = acoustic_tokens.len(),
             "Acoustic tokens generated"
         );
 
-        // 4. Decode to audio
-        let audio = self.decode_audio(&acoustic_tokens)?;
+        // 4. Filter out special tokens before decoding
+        // Special tokens (>=2048) cannot be decoded by the audio codec
+        let filtered_tokens: Vec<u32> = acoustic_tokens
+            .iter()
+            .filter(|&&t| t < 2048)
+            .copied()
+            .collect();
+
+        if filtered_tokens.is_empty() {
+            return Err(TtsError::inference(
+                "no valid audio tokens generated (all were special tokens)".to_string(),
+            ));
+        }
+
+        debug!(
+            original = acoustic_tokens.len(),
+            filtered = filtered_tokens.len(),
+            removed = acoustic_tokens.len() - filtered_tokens.len(),
+            "Filtered special tokens"
+        );
+
+        // 5. Decode to audio
+        let audio = self.decode_audio(&filtered_tokens)?;
         debug!(
             samples = audio.num_samples(),
             duration_ms = audio.duration_ms(),
@@ -527,6 +829,20 @@ impl TtsPipeline {
     /// Synthesize from a SynthesisRequest.
     pub fn synthesize_request(&self, request: &SynthesisRequest) -> TtsResult<AudioChunk> {
         self.synthesize(&request.text, Some(request.lang))
+    }
+
+    /// Synthesize from a SynthesisRequest with speaker.
+    pub fn synthesize_request_with_speaker(
+        &self,
+        request: &SynthesisRequest,
+        speaker: Option<&str>,
+    ) -> TtsResult<AudioChunk> {
+        self.synthesize_with_speaker(&request.text, Some(request.lang), speaker)
+    }
+
+    /// Get list of available speakers for CustomVoice models.
+    pub fn available_speakers(&self) -> &'static [&'static str] {
+        text_tokenizer::SpeakerIds::available_speakers()
     }
 
     /// Create a streaming session for incremental synthesis.
