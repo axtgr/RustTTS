@@ -52,7 +52,7 @@ impl Default for PipelineConfig {
             default_lang: Lang::Ru,
             crossfade_ms: DEFAULT_CROSSFADE_MS,
             chunk_tokens: 10,
-            max_seq_len: 4096, // Max sequence length for audio generation
+            max_seq_len: 400, // Max sequence length for audio generation (~33 seconds at 12Hz)
             default_speaker: None,
             is_custom_voice: false,
         }
@@ -749,50 +749,30 @@ impl TtsPipeline {
         info!("min_new_tokens={} (matching Python SDK)", min_tokens);
 
         // ========== COMPUTE trailing_text_hidden ==========
-        // Python SDK (modeling_qwen3_tts.py:2230-2232):
-        // trailing_text_hidden = torch.cat((self.talker.text_projection(
-        //     self.talker.get_text_embeddings()(input_id[:, 4:-5])
-        // ), tts_eos_embed), dim=1)
+        // In non_streaming_mode (which we use), ALL text tokens are already in prefill.
+        // Python SDK (modeling_qwen3_tts.py:2227):
+        //     trailing_text_hidden = tts_pad_embed
         //
-        // This is: text_projection(text_tokens[1:]) concatenated with tts_eos_embed
-        // The first text token goes into prefill, remaining are for trailing conditioning
+        // This is just a single tts_pad embedding that gets used for ALL generation steps.
+        // The text conditioning comes from the prefill, not from trailing_text_hidden.
         //
-        // For text "Hello world" with tokens [15339, 1917]:
-        // - text_tokens[0] = 15339 goes into prefill (combined with codec embeddings)
-        // - text_tokens[1:] = [1917] + tts_eos becomes trailing_text_hidden
-        //
-        // During generation step i:
-        // - if i < len(trailing_text_hidden): use trailing_text_hidden[i]
-        // - else: use tts_pad_embed
-        // trailing_text_hidden: text conditioning for generation steps
-        // Each step uses trailing_text_hidden[step] until exhausted, then uses tts_pad_embed
-        let trailing_text_hidden = if text_tokens.len() > 1 {
-            // Build trailing tokens: text_tokens[1:] + tts_eos
-            let mut trailing_tokens: Vec<u32> = text_tokens[1..].to_vec();
-            trailing_tokens.push(st.tts_eos_token_id);
+        // IMPORTANT: In non_streaming_mode, trailing_text_hidden is NOT the remaining text!
+        // It's just tts_pad because all text is already encoded in the prefill.
+        let tts_pad_tensor = Tensor::new(&[st.tts_pad_token_id], &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-            let trailing_tensor = Tensor::new(trailing_tokens.as_slice(), &self.device)
-                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-                .unsqueeze(0)
-                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+        let tts_pad_embed = model
+            .get_text_embedding(&tts_pad_tensor)
+            .map_err(|e| TtsError::inference(format!("tts_pad embed failed: {e}")))?;
 
-            // Get text embeddings with projection
-            let trailing_embed = model
-                .get_text_embedding(&trailing_tensor)
-                .map_err(|e| TtsError::inference(format!("trailing text embed failed: {e}")))?;
+        info!(
+            "non_streaming_mode: trailing_text_hidden = tts_pad_embed only, shape: {:?}",
+            tts_pad_embed.dims()
+        );
 
-            info!(
-                "Built trailing_text_hidden from {} tokens (text[1:] + eos), shape: {:?}",
-                trailing_tokens.len(),
-                trailing_embed.dims()
-            );
-
-            Some(trailing_embed)
-        } else {
-            // Only one text token, no trailing hidden needed
-            info!("Single text token, no trailing_text_hidden");
-            None
-        };
+        let trailing_text_hidden = Some(tts_pad_embed);
 
         // Use new method with CodePredictor if available
         // This correctly sums all 16 codebook embeddings at each generation step
@@ -1247,37 +1227,34 @@ impl TtsPipeline {
             "Acoustic tokens generated"
         );
 
-        // 4. Filter out special tokens before decoding
-        // Codec special tokens (2148-2157) are control tokens, not audio data:
-        // - 2148: codec_pad_id
-        // - 2149: codec_bos_id
-        // - 2150: codec_eos_id
-        // - 2154: codec_think_id
-        // - 2155: codec_nothink_id
-        // - 2156: codec_think_bos_id
-        // - 2157: codec_think_eos_id
-        // Audio tokens are in range 0-2047 (codec vocab_size)
-        let filtered_tokens: Vec<u32> = acoustic_tokens
-            .iter()
-            .filter(|&&t| t < 2048) // valid audio tokens
-            .copied()
-            .collect();
+        // 4. acoustic_tokens is in interleaved format: [c0_f0, c1_f0, ..., c15_f0, c0_f1, ...]
+        // Convert to multi-codebook format: Vec<Vec<u32>> where each inner Vec is one codebook
+        const NUM_CODEBOOKS: usize = 16;
+        let num_frames = acoustic_tokens.len() / NUM_CODEBOOKS;
 
-        if filtered_tokens.is_empty() {
-            return Err(TtsError::inference(
-                "no valid audio tokens generated (all were special tokens)".to_string(),
-            ));
+        if num_frames == 0 {
+            return Err(TtsError::inference("no audio frames generated".to_string()));
+        }
+
+        // Reshape interleaved to [num_codebooks][num_frames]
+        let mut multi_tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(num_frames); NUM_CODEBOOKS];
+        for frame_idx in 0..num_frames {
+            for cb_idx in 0..NUM_CODEBOOKS {
+                let token = acoustic_tokens[frame_idx * NUM_CODEBOOKS + cb_idx];
+                // Clamp tokens to valid range (0-2047)
+                let clamped = if token >= 2048 { 0 } else { token };
+                multi_tokens[cb_idx].push(clamped);
+            }
         }
 
         debug!(
-            original = acoustic_tokens.len(),
-            filtered = filtered_tokens.len(),
-            removed = acoustic_tokens.len() - filtered_tokens.len(),
-            "Filtered special tokens"
+            num_frames = num_frames,
+            codebooks = NUM_CODEBOOKS,
+            "Converted interleaved to multi-codebook format"
         );
 
-        // 5. Decode to audio
-        let audio = self.decode_audio(&filtered_tokens)?;
+        // 5. Decode using multi-codebook decoder
+        let audio = self.codec.decode_multi(&multi_tokens)?;
         debug!(
             samples = audio.num_samples(),
             duration_ms = audio.duration_ms(),

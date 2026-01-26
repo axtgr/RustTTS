@@ -565,7 +565,8 @@ impl Model {
         let mut sampler = Sampler::new(sampling_config.clone());
         let mut generated_zeroth: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut all_frames: Vec<Vec<u32>> = Vec::with_capacity(max_new_tokens);
-        let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
+        // Note: We only keep the last hidden state to save memory
+        let mut last_hidden_state: Option<Tensor> = None;
 
         // Suppress tokens: special tokens (2048-3071) except EOS
         let suppress_start = 2048u32;
@@ -626,7 +627,7 @@ impl Model {
         }
 
         generated_zeroth.push(current_zeroth_token);
-        all_hidden_states.push(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
+        last_hidden_state = Some(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
 
         // Predict residual codebooks for first token using CodePredictor
         let first_hidden = hidden_states.i((.., seq_len - 1..seq_len, ..))?;
@@ -735,14 +736,17 @@ impl Model {
             // Sample next zeroth token
             let next_zeroth = sampler.sample(&logits_vec);
 
-            // Log progress
-            if step % 50 == 0 || next_zeroth >= 2048 {
+            // Log progress every 10 steps or on special events
+            let is_eos = Some(next_zeroth) == eos_token_id;
+            if step % 10 == 0 || next_zeroth >= 2048 || is_eos {
                 info!(
-                    "Step {}: zeroth={}, eos={:?}, is_eos={}, generated={}",
+                    "Step {}/{}: zeroth={}, eos={:?}, is_eos={}, min_reached={}, generated={}",
                     step,
+                    max_new_tokens,
                     next_zeroth,
                     eos_token_id,
-                    Some(next_zeroth) == eos_token_id,
+                    is_eos,
+                    generated_zeroth.len() >= min_new_tokens,
                     generated_zeroth.len()
                 );
             }
@@ -758,8 +762,8 @@ impl Model {
                 break;
             }
 
-            // Store hidden state
-            all_hidden_states.push(hidden_states.clone());
+            // Keep only last hidden state to save memory
+            last_hidden_state = Some(hidden_states.clone());
 
             generated_zeroth.push(next_zeroth);
 
@@ -792,14 +796,13 @@ impl Model {
             all_frames.len()
         );
 
-        // Concatenate hidden states
-        let concatenated_hidden = if all_hidden_states.is_empty() {
-            Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?
-        } else {
-            Tensor::cat(&all_hidden_states, 1)?
-        };
+        // Return last hidden state only (or empty tensor)
+        let final_hidden = last_hidden_state.unwrap_or_else(|| {
+            Tensor::zeros((1, 1, self.config.hidden_size), DType::F32, &self.device)
+                .expect("Failed to create empty hidden state")
+        });
 
-        Ok((generated_zeroth, all_frames, concatenated_hidden))
+        Ok((generated_zeroth, all_frames, final_hidden))
     }
 
     /// Suppress special tokens in logits (set to -inf) except for EOS token.

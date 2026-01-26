@@ -12,11 +12,11 @@
       {
         "title": "Qwen3-TTS",
         "width": 600,
-        "height": 700,
+        "height": 900,
         "resizable": true,
         "center": true,
         "minWidth": 400,
-        "minHeight": 500
+        "minHeight": 600
       }
     ],
     "security": {

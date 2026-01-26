@@ -450,19 +450,13 @@
                 console.log('Setting isInitialized = true');
                 isInitialized = true;
                 
-                // Show success message briefly
-                showInitStatus('Model loaded! Starting...', 'success');
+                // Hide overlay immediately
+                console.log('Hiding initOverlay immediately');
+                initOverlay.style.display = 'none';
+                initOverlay.classList.add('hidden');
                 
-                // Small delay to let user see success, then hide overlay
-                setTimeout(() => {
-                    console.log('Hiding initOverlay, element:', initOverlay);
-                    initOverlay.style.display = 'none'; // Direct style as backup
-                    initOverlay.classList.add('hidden');
-                    console.log('initOverlay classes after:', initOverlay.className);
-                    
-                    speakBtn.disabled = false;
-                    console.log('Init complete!');
-                }, 500);
+                speakBtn.disabled = false;
+                console.log('Init complete! Main UI should be visible now.');
 
             } catch (e) {
                 console.error('initTTS error:', e);

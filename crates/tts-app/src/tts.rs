@@ -11,7 +11,7 @@ use tauri::State;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use audio_codec_12hz::apply_fade_in;
+use audio_codec_12hz::{apply_fade_in, apply_fade_out};
 use runtime::TtsPipeline;
 use tts_core::Lang;
 
@@ -200,10 +200,11 @@ pub async fn speak(
     let sample_rate = audio.sample_rate;
     let num_samples = audio.num_samples();
 
-    // Apply fade-in to remove artifacts
+    // Apply fade-in/fade-out to remove artifacts at beginning and end
     // audio.pcm is Arc<[f32]>, need to clone to mutable Vec
     let mut samples: Vec<f32> = audio.pcm.to_vec();
-    apply_fade_in(&mut samples, 50.0, sample_rate);
+    apply_fade_in(&mut samples, 20.0, sample_rate); // 20ms fade-in
+    apply_fade_out(&mut samples, 100.0, sample_rate); // 100ms fade-out (longer to remove end noise)
 
     // Create WAV in memory
     let wav_data = create_wav_buffer(&samples, sample_rate);
