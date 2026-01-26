@@ -417,6 +417,10 @@ impl Model {
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
 
+        // Suppress tokens: special tokens (2048-3071) except EOS
+        let suppress_start = 2048u32;
+        let suppress_end = self.config.codec_vocab_size as u32;
+
         // Step 1: Prefill with text tokens only (using text_embedding)
         let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, text_len]
         let (_, _, text_kv_caches) =
@@ -438,7 +442,11 @@ impl Model {
 
         // Sample first codec token from logits after codec_bos
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-        let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+        let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+        // Suppress special tokens (except EOS)
+        Self::suppress_special_tokens(&mut logits_vec, suppress_start, suppress_end, eos_token_id);
+
         let mut current_token = sampler.sample(&logits_vec);
 
         debug!("Step 0: sampled token {} after codec_bos", current_token);
@@ -473,13 +481,21 @@ impl Model {
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-            let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+            let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+            // Suppress special tokens (except EOS)
+            Self::suppress_special_tokens(
+                &mut logits_vec,
+                suppress_start,
+                suppress_end,
+                eos_token_id,
+            );
 
             // Sample next token
             let next_token = sampler.sample(&logits_vec);
 
             // Log every 50 steps or when close to EOS
-            if step % 50 == 0 || next_token >= 2145 {
+            if step % 50 == 0 || next_token >= 2048 {
                 info!(
                     "Step {}: token={}, eos_token={:?}, is_eos={}",
                     step,
@@ -523,11 +539,16 @@ impl Model {
     /// In Qwen3-TTS, the input to the talker is a **sum** of text_embedding and codec_embedding,
     /// not a concatenation. This method generates from pre-computed combined embeddings.
     ///
+    /// **Important:** During generation, each generated codec token must be combined with
+    /// `tts_pad` embedding to maintain the dual-track pattern expected by the model.
+    ///
     /// # Arguments
     /// - `combined_embeds`: Pre-computed embeddings [1, seq_len, hidden_size] = text_embed + codec_embed
+    /// - `tts_pad_token_id`: The TTS pad token ID to combine with generated codec tokens
     /// - `max_new_tokens`: Maximum number of tokens to generate
     /// - `sampling_config`: Sampling configuration
     /// - `eos_token_id`: EOS token ID to stop generation
+    /// - `min_new_tokens`: Minimum tokens before EOS is allowed (prevents early termination)
     ///
     /// # Returns
     /// Tuple of (tokens, hidden_states)
@@ -535,19 +556,31 @@ impl Model {
     pub fn generate_from_embeds(
         &self,
         combined_embeds: &Tensor,
+        tts_pad_token_id: u32,
         max_new_tokens: usize,
         sampling_config: SamplingConfig,
         eos_token_id: Option<u32>,
+        min_new_tokens: usize,
     ) -> Result<(Vec<u32>, Tensor)> {
         let seq_len = combined_embeds.dim(1)?;
         info!(
-            "Generating up to {} tokens from {} prefill embeddings",
-            max_new_tokens, seq_len
+            "Generating up to {} tokens (min={}) from {} prefill embeddings, tts_pad={}",
+            max_new_tokens, min_new_tokens, seq_len, tts_pad_token_id
         );
 
         let mut sampler = Sampler::new(sampling_config);
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
+
+        // Suppress tokens: special tokens (2048-3071) except EOS
+        // Audio tokens are 0-2047, special tokens start at 2048
+        let suppress_start = 2048u32;
+        let suppress_end = self.config.codec_vocab_size as u32;
+
+        // Pre-compute tts_pad embedding for dual-track generation
+        // During generation, each codec token is combined with tts_pad embedding
+        let tts_pad_tensor = Tensor::new(&[tts_pad_token_id], &self.device)?.unsqueeze(0)?;
+        let tts_pad_embed = self.embed_text(&tts_pad_tensor)?; // [1, 1, hidden_size]
 
         // Step 1: Prefill with combined embeddings
         let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
@@ -557,7 +590,23 @@ impl Model {
 
         // Sample first codec token from last position's logits
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-        let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+        let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+        // Log top logits before suppression for debugging
+        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+        info!("Top 5 logits before suppress (step 0): {:?}", top_5);
+
+        // Suppress special tokens (except EOS)
+        Self::suppress_special_tokens(&mut logits_vec, suppress_start, suppress_end, eos_token_id);
+
+        // Log top logits after suppression
+        let mut indexed_after: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+        indexed_after.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top_5_after: Vec<(usize, f32)> = indexed_after.iter().take(5).copied().collect();
+        info!("Top 5 logits after suppress (step 0): {:?}", top_5_after);
+
         let mut current_token = sampler.sample(&logits_vec);
 
         debug!("Step 0: sampled token {} from prefill", current_token);
@@ -574,38 +623,70 @@ impl Model {
         // This is the hidden state at the last position of prefill, which produced current_token
         all_hidden_states.push(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
 
-        // Generate remaining tokens
+        // Generate remaining tokens with dual-track: tts_pad + codec token
         for step in 1..max_new_tokens {
             // Embed current codec token
             let codec_tensor = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
             let codec_embed = self.embed_codec(&codec_tensor)?;
 
-            // Forward pass with codec embedding
+            // DUAL-TRACK: Combine codec embedding with tts_pad embedding
+            // This maintains the pattern expected by the model during generation
+            let combined_step_embed = (&tts_pad_embed + &codec_embed)?;
+
+            // Forward pass with combined dual-track embedding
             let (logits, hidden_states, new_kv_caches) =
-                self.forward_embeds(&codec_embed, position_offset, kv_caches.as_deref())?;
+                self.forward_embeds(&combined_step_embed, position_offset, kv_caches.as_deref())?;
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-            let logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+            let mut logits_vec: Vec<f32> = last_logits.squeeze(0)?.to_vec1()?;
+
+            // Log top logits for early steps
+            if step <= 3 {
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+                info!("Top 5 logits before suppress (step {}): {:?}", step, top_5);
+            }
+
+            // Suppress special tokens (except EOS)
+            // Also suppress EOS if we haven't reached min_new_tokens yet
+            let effective_eos = if generated.len() < min_new_tokens {
+                None // Don't allow EOS yet
+            } else {
+                eos_token_id
+            };
+            Self::suppress_special_tokens(
+                &mut logits_vec,
+                suppress_start,
+                suppress_end,
+                effective_eos,
+            );
 
             // Sample next token
             let next_token = sampler.sample(&logits_vec);
 
             // Log every 50 steps or when close to EOS
-            if step % 50 == 0 || next_token >= 2145 {
+            if step % 50 == 0 || next_token >= 2048 {
                 info!(
-                    "Step {}: token={}, eos_token={:?}, is_eos={}",
+                    "Step {}: token={}, eos_token={:?}, is_eos={}, generated={}",
                     step,
                     next_token,
                     eos_token_id,
-                    Some(next_token) == eos_token_id
+                    Some(next_token) == eos_token_id,
+                    generated.len()
                 );
             }
             debug!("Step {}: generated token {}", step, next_token);
 
-            // Check for EOS
-            if Some(next_token) == eos_token_id {
-                info!("EOS token generated at step {}", step);
+            // Check for EOS (only after min_new_tokens)
+            if Some(next_token) == eos_token_id && generated.len() >= min_new_tokens {
+                info!(
+                    "EOS token generated at step {} (after {} tokens)",
+                    step,
+                    generated.len()
+                );
                 break;
             }
 
@@ -631,6 +712,25 @@ impl Model {
         };
 
         Ok((generated, concatenated_hidden))
+    }
+
+    /// Suppress special tokens in logits (set to -inf) except for EOS token.
+    ///
+    /// In Qwen3-TTS, tokens 0-2047 are valid audio codes.
+    /// Tokens 2048+ are special tokens (pad, bos, eos, think markers, etc.)
+    /// During generation, we should only allow audio tokens and EOS.
+    fn suppress_special_tokens(
+        logits: &mut [f32],
+        suppress_start: u32,
+        suppress_end: u32,
+        eos_token_id: Option<u32>,
+    ) {
+        for i in suppress_start..suppress_end.min(logits.len() as u32) {
+            // Don't suppress EOS token
+            if Some(i) != eos_token_id {
+                logits[i as usize] = f32::NEG_INFINITY;
+            }
+        }
     }
 
     /// Forward pass from pre-computed embeddings (for CustomVoice flow).

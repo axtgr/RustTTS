@@ -473,11 +473,11 @@ impl TtsPipeline {
     /// Generate acoustic tokens with speaker for CustomVoice models.
     ///
     /// This builds the proper prompt format following Python implementation:
-    /// 1. Role prefix: [im_start, assistant, newline] - goes through text_embedding only
-    /// 2. Codec prefix: [think, think_bos, lang_id?, think_eos, speaker_id?, pad, bos]
-    ///    with text: [tts_pad, ..., tts_bos] - combined embeddings
-    /// 3. Text tokens: text_tokens with codec_pad - combined embeddings
-    /// 4. Final: [tts_eos + codec_pad], then [tts_pad + codec_bos] to start generation
+    /// 1. Role prefix: [im_start, assistant, newline] - combined with codec_pad embeddings
+    /// 2. Codec prefix: [think, think_bos, lang_id?, think_eos, speaker_id?]
+    ///    with text: [tts_pad, ...] - combined embeddings  
+    /// 3. Text tokens: [tts_bos, text_tokens..., tts_eos] with [codec_pad, codec_pad..., codec_pad]
+    /// 4. Final trigger: [tts_pad] + [codec_bos] to start generation
     fn generate_acoustic_with_speaker(
         &self,
         model: &AcousticModel,
@@ -511,25 +511,40 @@ impl TtsPipeline {
             text_tokens.len()
         );
 
-        // ========== PART 1: Role prefix (text embedding only) ==========
-        // [im_start, assistant, newline] - these go through text_embedding only, not combined with codec
+        // ========== PART 1: Role prefix with codec_pad ==========
+        // [im_start, assistant, newline] combined with [codec_pad, codec_pad, codec_pad]
         let role_prefix: Vec<u32> = vec![
             st.im_start_token_id,  // 151644
             st.assistant_token_id, // 77091
             st.newline_token_id,   // 198
         ];
+        let role_codec: Vec<u32> = vec![st.codec_pad_id; role_prefix.len()];
 
         let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let role_prefix_embed = model
+        let role_codec_tensor = Tensor::new(role_codec.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let role_text_embed = model
             .get_text_embedding(&role_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        // ========== PART 2: Codec prefix with combined embeddings ==========
-        // Build codec prefix: [think, think_bos, (lang_id), think_eos, (speaker_id), pad, bos]
+        let role_codec_embed = model
+            .get_codec_embedding(&role_codec_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        // Combine role: text_embed + codec_embed
+        let role_combined = (&role_text_embed + &role_codec_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 2: Codec prefix with tts_pad ==========
+        // Build codec prefix: [think, think_bos, (lang_id), think_eos, (speaker_id)]
+        // Each paired with tts_pad on text side
         let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
         if let Some(lid) = lang_id {
             codec_prefix.push(lid);
@@ -538,20 +553,11 @@ impl TtsPipeline {
         if let Some(sid) = speaker_id {
             codec_prefix.push(sid);
         }
-        codec_prefix.push(st.codec_pad_id);
-        codec_prefix.push(st.codec_bos_id);
 
-        // Text for codec prefix: all tts_pad except last which is tts_bos
-        // But we take [:-1] because the last codec_bos pairs with first text token
-        let text_for_codec_prefix: Vec<u32> = codec_prefix
-            .iter()
-            .take(codec_prefix.len() - 1) // exclude last (codec_bos)
-            .map(|_| st.tts_pad_token_id)
-            .collect();
+        // Text side: all tts_pad
+        let text_for_codec_prefix: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len()];
 
-        let codec_prefix_for_embed: Vec<u32> = codec_prefix[..codec_prefix.len() - 1].to_vec();
-
-        let codec_prefix_tensor = Tensor::new(codec_prefix_for_embed.as_slice(), &self.device)
+        let codec_prefix_tensor = Tensor::new(codec_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
@@ -575,27 +581,16 @@ impl TtsPipeline {
         let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
-        // ========== PART 3: Text tokens with codec_pad + first text with codec_bos ==========
-        // First text token pairs with codec_bos
-        // Rest of text tokens pair with codec_pad
-        // Then tts_eos pairs with codec_pad
-        // Finally tts_pad pairs with codec_bos (start of generation)
-
-        // Build text sequence: [tts_bos, text_tokens..., tts_eos, tts_pad]
-        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        // ========== PART 3: Text tokens with codec_pad ==========
+        // Build text sequence: [tts_bos, text_tokens..., tts_eos]
+        // Build codec sequence: [codec_pad, codec_pad..., codec_pad]
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 2);
         text_seq.push(st.tts_bos_token_id);
         text_seq.extend_from_slice(text_tokens);
         text_seq.push(st.tts_eos_token_id);
-        text_seq.push(st.tts_pad_token_id);
 
-        // Build codec sequence: [codec_bos, codec_pad..., codec_pad, codec_bos]
-        let mut codec_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
-        codec_seq.push(st.codec_bos_id); // pairs with tts_bos
-        for _ in 0..text_tokens.len() {
-            codec_seq.push(st.codec_pad_id); // pairs with each text token
-        }
-        codec_seq.push(st.codec_pad_id); // pairs with tts_eos
-        codec_seq.push(st.codec_bos_id); // pairs with tts_pad (start generation)
+        // All codec_pad for text tokens
+        let codec_seq: Vec<u32> = vec![st.codec_pad_id; text_seq.len()];
 
         let text_seq_tensor = Tensor::new(text_seq.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
@@ -619,37 +614,75 @@ impl TtsPipeline {
         let text_combined = (&text_seq_embed + &codec_seq_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
-        // ========== PART 4: Concatenate all parts ==========
-        // [role_prefix_embed] + [codec_prefix_combined] + [text_combined]
+        // ========== PART 4: Generation trigger ==========
+        // Final position: [tts_pad] + [codec_bos] - this triggers audio generation
+        let trigger_text = Tensor::new(&[st.tts_pad_token_id], &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let trigger_codec = Tensor::new(&[st.codec_bos_id], &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let trigger_text_embed = model
+            .get_text_embedding(&trigger_text)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        let trigger_codec_embed = model
+            .get_codec_embedding(&trigger_codec)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let trigger_combined = (&trigger_text_embed + &trigger_codec_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 5: Concatenate all parts ==========
+        // [role_combined] + [codec_prefix_combined] + [text_combined] + [trigger_combined]
         let combined_embeds = Tensor::cat(
-            &[role_prefix_embed, codec_prefix_combined, text_combined],
+            &[
+                role_combined,
+                codec_prefix_combined,
+                text_combined,
+                trigger_combined,
+            ],
             1,
         )
         .map_err(|e| TtsError::inference(format!("cat failed: {e}")))?;
 
         debug!(
             role_len = role_prefix.len(),
-            codec_prefix_len = codec_prefix_for_embed.len(),
+            codec_prefix_len = codec_prefix.len(),
             text_seq_len = text_seq.len(),
+            trigger_len = 1,
             combined_shape = ?combined_embeds.dims(),
             "Combined embeddings built"
         );
 
-        // Configure sampling
+        // Configure sampling - use fixed seed for reproducibility during debugging
         let sampling_config = SamplingConfig {
-            temperature: 0.9,
-            top_p: 1.0,
+            temperature: 0.7,
+            top_p: 0.9,
             top_k: 50,
-            seed: None,
+            seed: Some(42),
         };
 
-        // Generate from combined embeddings
+        // Generate from combined embeddings with dual-track
+        // min_new_tokens based on text length: ~5-10 audio tokens per text token
+        let min_tokens = (text_tokens.len() * 5).max(20);
+        info!(
+            "Setting min_new_tokens={} based on {} text tokens",
+            min_tokens,
+            text_tokens.len()
+        );
         let (zeroth_tokens, hidden_states) = model
             .generate_from_embeds(
                 &combined_embeds,
+                st.tts_pad_token_id,
                 max_tokens,
                 sampling_config.clone(),
                 Some(st.codec_eos_id),
+                min_tokens,
             )
             .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
 
@@ -700,23 +733,36 @@ impl TtsPipeline {
         };
         let lang_id = st.language_ids.by_name(lang_name);
 
-        // Build prompt (same as generate_acoustic_with_speaker)
+        // ========== PART 1: Role prefix with codec_pad ==========
         let role_prefix: Vec<u32> = vec![
             st.im_start_token_id,
             st.assistant_token_id,
             st.newline_token_id,
         ];
+        let role_codec: Vec<u32> = vec![st.codec_pad_id; role_prefix.len()];
 
         let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
 
-        let role_prefix_embed = model
+        let role_codec_tensor = Tensor::new(role_codec.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let role_text_embed = model
             .get_text_embedding(&role_prefix_tensor)
             .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
 
-        // Build codec prefix
+        let role_codec_embed = model
+            .get_codec_embedding(&role_codec_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let role_combined = (&role_text_embed + &role_codec_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 2: Codec prefix with tts_pad ==========
         let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
         if let Some(lid) = lang_id {
             codec_prefix.push(lid);
@@ -725,18 +771,10 @@ impl TtsPipeline {
         if let Some(sid) = speaker_id {
             codec_prefix.push(sid);
         }
-        codec_prefix.push(st.codec_pad_id);
-        codec_prefix.push(st.codec_bos_id);
 
-        let text_for_codec_prefix: Vec<u32> = codec_prefix
-            .iter()
-            .take(codec_prefix.len() - 1)
-            .map(|_| st.tts_pad_token_id)
-            .collect();
+        let text_for_codec_prefix: Vec<u32> = vec![st.tts_pad_token_id; codec_prefix.len()];
 
-        let codec_prefix_for_embed: Vec<u32> = codec_prefix[..codec_prefix.len() - 1].to_vec();
-
-        let codec_prefix_tensor = Tensor::new(codec_prefix_for_embed.as_slice(), &self.device)
+        let codec_prefix_tensor = Tensor::new(codec_prefix.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
             .unsqueeze(0)
             .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
@@ -759,20 +797,13 @@ impl TtsPipeline {
         let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
-        // Build text sequence
-        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        // ========== PART 3: Text tokens with codec_pad ==========
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 2);
         text_seq.push(st.tts_bos_token_id);
         text_seq.extend_from_slice(text_tokens);
         text_seq.push(st.tts_eos_token_id);
-        text_seq.push(st.tts_pad_token_id);
 
-        let mut codec_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
-        codec_seq.push(st.codec_bos_id);
-        for _ in 0..text_tokens.len() {
-            codec_seq.push(st.codec_pad_id);
-        }
-        codec_seq.push(st.codec_pad_id);
-        codec_seq.push(st.codec_bos_id);
+        let codec_seq: Vec<u32> = vec![st.codec_pad_id; text_seq.len()];
 
         let text_seq_tensor = Tensor::new(text_seq.as_slice(), &self.device)
             .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
@@ -795,8 +826,36 @@ impl TtsPipeline {
         let text_combined = (&text_seq_embed + &codec_seq_embed)
             .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
 
+        // ========== PART 4: Generation trigger ==========
+        let trigger_text = Tensor::new(&[st.tts_pad_token_id], &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let trigger_codec = Tensor::new(&[st.codec_bos_id], &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let trigger_text_embed = model
+            .get_text_embedding(&trigger_text)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        let trigger_codec_embed = model
+            .get_codec_embedding(&trigger_codec)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let trigger_combined = (&trigger_text_embed + &trigger_codec_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // ========== PART 5: Concatenate all parts ==========
         let combined_embeds = Tensor::cat(
-            &[role_prefix_embed, codec_prefix_combined, text_combined],
+            &[
+                role_combined,
+                codec_prefix_combined,
+                text_combined,
+                trigger_combined,
+            ],
             1,
         )
         .map_err(|e| TtsError::inference(format!("cat failed: {e}")))?;
@@ -808,13 +867,17 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Generate zeroth codebook
+        // Generate zeroth codebook with dual-track
+        // min_new_tokens based on text length
+        let min_tokens = (text_tokens.len() * 5).max(20);
         let (zeroth_tokens, hidden_states) = model
             .generate_from_embeds(
                 &combined_embeds,
+                st.tts_pad_token_id,
                 max_tokens,
                 sampling_config.clone(),
                 Some(st.codec_eos_id),
+                min_tokens,
             )
             .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
 
@@ -1012,10 +1075,18 @@ impl TtsPipeline {
         );
 
         // 4. Filter out special tokens before decoding
-        // Special tokens (>=2048) cannot be decoded by the audio codec
+        // Codec special tokens (2148-2157) are control tokens, not audio data:
+        // - 2148: codec_pad_id
+        // - 2149: codec_bos_id
+        // - 2150: codec_eos_id
+        // - 2154: codec_think_id
+        // - 2155: codec_nothink_id
+        // - 2156: codec_think_bos_id
+        // - 2157: codec_think_eos_id
+        // Audio tokens are in range 0-2047 (codec vocab_size)
         let filtered_tokens: Vec<u32> = acoustic_tokens
             .iter()
-            .filter(|&&t| t < 2048)
+            .filter(|&&t| t < 2048) // valid audio tokens
             .copied()
             .collect();
 
