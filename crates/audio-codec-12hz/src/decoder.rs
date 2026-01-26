@@ -2497,11 +2497,13 @@ impl HifiUpsampleBlock {
             ..Default::default()
         };
 
-        // Calculate trim amounts (matching Python CausalTransConvNet)
-        let pad = kernel_size.saturating_sub(upsample_factor);
-        let left_pad = (pad + 1) / 2; // ceil(pad / 2)
-        let right_pad = left_pad;
-        let upsample_trim = (left_pad, right_pad);
+        // Calculate trim amounts (matching Python CausalTransConvNet exactly)
+        // Python formula:
+        //   trim_left = (kernel_size // 2) - 1
+        //   trim_right = kernel_size - stride
+        let trim_left = (kernel_size / 2).saturating_sub(1);
+        let trim_right = kernel_size.saturating_sub(upsample_factor);
+        let upsample_trim = (trim_left, trim_right);
 
         let upsample_conv = conv_transpose1d(
             in_channels,
@@ -2553,11 +2555,13 @@ impl HifiUpsampleBlock {
     ) -> CandleResult<Self> {
         let snake = Snake::new_random(in_channels, device)?;
 
-        // Calculate trim amounts (matching Python CausalTransConvNet)
-        let pad = kernel_size.saturating_sub(upsample_factor);
-        let left_pad = (pad + 1) / 2;
-        let right_pad = left_pad;
-        let upsample_trim = (left_pad, right_pad);
+        // Calculate trim amounts (matching Python CausalTransConvNet exactly)
+        // Python formula:
+        //   trim_left = (kernel_size // 2) - 1
+        //   trim_right = kernel_size - stride
+        let trim_left = (kernel_size / 2).saturating_sub(1);
+        let trim_right = kernel_size.saturating_sub(upsample_factor);
+        let upsample_trim = (trim_left, trim_right);
 
         let w = Tensor::randn(
             0.0f32,
