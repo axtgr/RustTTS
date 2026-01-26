@@ -8,7 +8,10 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::code_predictor::CodePredictor;
 use crate::config::AcousticModelConfig;
-use crate::layers::{RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
+use crate::layers::{
+    MultimodalRotaryEmbedding, RmsNorm, RotaryEmbedding, RotaryEmbeddingTrait, TextProjection,
+    TransformerBlock,
+};
 use crate::sampling::{Sampler, SamplingConfig, apply_repetition_penalty};
 
 /// KV cache type alias for transformer layers.
@@ -16,6 +19,24 @@ pub type KvCache = Vec<(Tensor, Tensor)>;
 
 /// Forward output with hidden states: (logits, hidden_states, kv_caches).
 pub type ForwardWithHiddenOutput = (Tensor, Tensor, KvCache);
+
+/// Rotary embedding variant: standard or multimodal.
+#[derive(Debug)]
+pub enum RotaryEmbeddingType {
+    /// Standard RoPE for non-multimodal models.
+    Standard(RotaryEmbedding),
+    /// Multimodal RoPE (M-RoPE) for Qwen3-TTS.
+    Multimodal(MultimodalRotaryEmbedding),
+}
+
+impl RotaryEmbeddingTrait for RotaryEmbeddingType {
+    fn apply(&self, q: &Tensor, k: &Tensor, position_offset: usize) -> Result<(Tensor, Tensor)> {
+        match self {
+            RotaryEmbeddingType::Standard(rope) => rope.apply(q, k, position_offset),
+            RotaryEmbeddingType::Multimodal(mrope) => mrope.apply(q, k, position_offset),
+        }
+    }
+}
 
 /// The main acoustic model for Qwen3-TTS (Talker).
 ///
@@ -39,8 +60,8 @@ pub struct Model {
     norm: RmsNorm,
     /// Output projection to codec vocabulary.
     codec_head: candle_nn::Linear,
-    /// Rotary position embeddings.
-    rotary_emb: RotaryEmbedding,
+    /// Rotary position embeddings (standard or multimodal).
+    rotary_emb: RotaryEmbeddingType,
     /// Model configuration.
     config: AcousticModelConfig,
     /// Device (CPU or CUDA).
@@ -174,14 +195,32 @@ impl Model {
             )
         })?;
 
-        // Rotary embeddings
+        // Rotary embeddings - use multimodal RoPE if mrope_section is configured
         let head_dim = config.head_dim;
-        let rotary_emb = RotaryEmbedding::new(
-            head_dim,
-            config.max_position_embeddings,
-            config.rope_theta as f32,
-            device,
-        )?;
+        let rotary_emb = if !config.mrope_section.is_empty() {
+            info!(
+                "Using multimodal RoPE with section={:?}, interleaved={}",
+                config.mrope_section, config.mrope_interleaved
+            );
+            let mrope = MultimodalRotaryEmbedding::new(
+                head_dim,
+                config.max_position_embeddings,
+                config.rope_theta as f32,
+                &config.mrope_section,
+                config.mrope_interleaved,
+                device,
+            )?;
+            RotaryEmbeddingType::Multimodal(mrope)
+        } else {
+            info!("Using standard RoPE");
+            let rope = RotaryEmbedding::new(
+                head_dim,
+                config.max_position_embeddings,
+                config.rope_theta as f32,
+                device,
+            )?;
+            RotaryEmbeddingType::Standard(rope)
+        };
 
         info!(
             "Model loaded: {} layers, hidden={}, embedding={}, text_vocab={}, codec_vocab={}",
@@ -809,8 +848,15 @@ impl Model {
         for (i, layer) in self.layers.iter().enumerate() {
             let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
 
-            let (new_hidden, k_cache, v_cache) =
-                layer.forward(&hidden_states, &self.rotary_emb, position_offset, kv_cache)?;
+            // Enable debug for layer 0 during prefill
+            let debug_layer = i == 0 && position_offset == 0 && seq_len > 1;
+            let (new_hidden, k_cache, v_cache) = layer.forward_with_debug(
+                &hidden_states,
+                &self.rotary_emb,
+                position_offset,
+                kv_cache,
+                debug_layer,
+            )?;
 
             hidden_states = new_hidden;
             new_kv_caches.push((k_cache, v_cache));
