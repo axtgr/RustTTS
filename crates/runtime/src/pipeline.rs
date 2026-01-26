@@ -1026,31 +1026,14 @@ impl TtsPipeline {
         // at each generation step (matching Python SDK behavior)
         info!("Using generate_from_embeds_with_predictor for multi-codebook generation");
 
-        // Build trailing_text_hidden: text_tokens[1:] + tts_eos with text_projection
-        // During generation step i, use trailing_text_hidden[i] if available, else tts_pad_embed
-        let trailing_text_hidden = if text_tokens.len() > 1 {
-            let mut trailing_tokens: Vec<u32> = text_tokens[1..].to_vec();
-            trailing_tokens.push(st.tts_eos_token_id);
-
-            let trailing_tensor = Tensor::new(trailing_tokens.as_slice(), &self.device)
-                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
-                .unsqueeze(0)
-                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
-
-            let trailing_embed = model
-                .get_text_embedding(&trailing_tensor)
-                .map_err(|e| TtsError::inference(format!("trailing text embed failed: {e}")))?;
-
-            info!(
-                "Built trailing_text_hidden from {} tokens (text[1:] + eos), shape: {:?}",
-                trailing_tokens.len(),
-                trailing_embed.dims()
-            );
-            Some(trailing_embed)
-        } else {
-            info!("Single text token, no trailing_text_hidden");
-            None
-        };
+        // In non_streaming_mode (which we use), the full text is already in the prefill embeddings.
+        // Python SDK sets trailing_text_hidden = tts_pad_embed (just pad, no text content).
+        // This is different from streaming mode where trailing_text_hidden contains text[1:] + eos.
+        //
+        // IMPORTANT: We must NOT include text in trailing_text_hidden, otherwise text is processed twice!
+        // Just pass None and let the model use tts_pad_embed internally.
+        let trailing_text_hidden: Option<Tensor> = None;
+        info!("Non-streaming mode: trailing_text_hidden = None (text already in prefill)");
 
         let (_zeroth_tokens, all_frames, _hidden_states) = model
             .generate_from_embeds_with_predictor(
