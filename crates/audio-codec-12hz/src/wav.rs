@@ -5,6 +5,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use tts_core::{AudioChunk, TtsError, TtsResult};
 
+/// Default fade-in duration in milliseconds for removing initial artifacts.
+pub const DEFAULT_FADE_IN_MS: f32 = 50.0;
+
 /// Write an audio chunk to a WAV file.
 pub fn write_wav(path: impl AsRef<Path>, chunk: &AudioChunk) -> TtsResult<()> {
     let spec = WavSpec {
@@ -70,6 +73,47 @@ pub fn write_raw_pcm<W: Write>(writer: &mut W, samples: &[f32]) -> TtsResult<()>
             .map_err(TtsError::Io)?;
     }
     Ok(())
+}
+
+/// Apply fade-in to audio samples to remove initial artifacts.
+///
+/// Uses a Hann window for smooth fade-in.
+///
+/// # Arguments
+/// * `samples` - Mutable slice of audio samples
+/// * `fade_ms` - Fade-in duration in milliseconds
+/// * `sample_rate` - Sample rate in Hz
+pub fn apply_fade_in(samples: &mut [f32], fade_ms: f32, sample_rate: u32) {
+    let fade_samples = ((fade_ms / 1000.0) * sample_rate as f32) as usize;
+    let fade_samples = fade_samples.min(samples.len());
+
+    for i in 0..fade_samples {
+        // Hann window fade-in: 0.5 * (1 - cos(π * t))
+        let t = i as f32 / fade_samples.max(1) as f32;
+        let gain = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+        samples[i] *= gain;
+    }
+}
+
+/// Apply fade-out to audio samples.
+///
+/// Uses a Hann window for smooth fade-out.
+///
+/// # Arguments
+/// * `samples` - Mutable slice of audio samples
+/// * `fade_ms` - Fade-out duration in milliseconds
+/// * `sample_rate` - Sample rate in Hz
+pub fn apply_fade_out(samples: &mut [f32], fade_ms: f32, sample_rate: u32) {
+    let fade_samples = ((fade_ms / 1000.0) * sample_rate as f32) as usize;
+    let fade_samples = fade_samples.min(samples.len());
+    let start = samples.len().saturating_sub(fade_samples);
+
+    for i in 0..fade_samples {
+        // Hann window fade-out: 0.5 * (1 + cos(π * t))
+        let t = i as f32 / fade_samples.max(1) as f32;
+        let gain = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+        samples[start + i] *= gain;
+    }
 }
 
 /// Read audio samples from a WAV file.

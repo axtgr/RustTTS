@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use candle_core::Device;
 use tracing::{debug, info};
 
-use audio_codec_12hz::wav::write_wav;
+use audio_codec_12hz::wav::{DEFAULT_FADE_IN_MS, apply_fade_in, write_wav};
 use runtime::TtsPipeline;
 use tts_core::Lang;
 
@@ -115,6 +115,11 @@ pub async fn run(options: SynthOptions) -> Result<()> {
         "Synthesis completed"
     );
 
+    // Apply fade-in to remove initial artifacts
+    let mut samples: Vec<f32> = audio.pcm.to_vec();
+    apply_fade_in(&mut samples, DEFAULT_FADE_IN_MS, audio.sample_rate);
+    let audio = tts_core::AudioChunk::new(samples, audio.sample_rate, audio.start_ms, audio.end_ms);
+
     // Calculate real-time factor
     let audio_duration_sec = audio.duration_ms() / 1000.0;
     let process_sec = synth_duration.as_secs_f32();
@@ -216,6 +221,9 @@ pub async fn run_streaming(options: SynthOptions) -> Result<()> {
             break;
         }
     }
+
+    // Apply fade-in to remove initial artifacts
+    apply_fade_in(&mut all_samples, DEFAULT_FADE_IN_MS, 24000);
 
     // Write combined audio to WAV
     let audio = tts_core::AudioChunk::new(all_samples, 24000, 0.0, 0.0);

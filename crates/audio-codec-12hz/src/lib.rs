@@ -22,6 +22,7 @@ use tts_core::{AudioChunk, AudioCodec, TtsError, TtsResult};
 
 pub use crossfade::Crossfader;
 pub use decoder::{DecoderConfig, MockDecoder, NeuralDecoder};
+pub use wav::{DEFAULT_FADE_IN_MS, apply_fade_in, apply_fade_out};
 
 /// Default sample rate for the codec.
 pub const DEFAULT_SAMPLE_RATE: u32 = 24000;
