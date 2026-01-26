@@ -2,11 +2,10 @@
 # Download Qwen3-TTS models from HuggingFace
 #
 # Usage:
-#   ./scripts/download_models.sh [--tiny|--base|--all]
+#   ./scripts/download_models.sh [--talker|--tokenizer|--all]
 #
 # Requirements:
-#   - huggingface-cli installed: pip install huggingface_hub
-#   - Or: brew install huggingface-cli
+#   - Python 3.8+ with huggingface_hub: pip install huggingface_hub
 
 set -euo pipefail
 
@@ -36,13 +35,13 @@ log_error() {
 }
 
 check_dependencies() {
-    if ! command -v huggingface-cli &> /dev/null; then
-        log_error "huggingface-cli not found!"
+    if ! python3 -c "import huggingface_hub" &> /dev/null; then
+        log_error "huggingface_hub not found!"
         echo "Install with: pip install huggingface_hub"
-        echo "Or: brew install huggingface-cli"
+        echo "Or: pip3 install --user huggingface_hub"
         exit 1
     fi
-    log_info "huggingface-cli found"
+    log_info "huggingface_hub found"
 }
 
 download_model() {
@@ -50,21 +49,24 @@ download_model() {
     local local_dir="$2"
     
     log_info "Downloading $model_name to $local_dir..."
+    log_info "This may take a while for large models..."
     
     mkdir -p "$local_dir"
     
-    local args=(
-        download
-        "$model_name"
-        --local-dir "$local_dir"
-        --local-dir-use-symlinks False
-    )
+    python3 << EOF
+from huggingface_hub import snapshot_download
+import os
+
+token = os.environ.get('HF_TOKEN', None) or None
+snapshot_download(
+    repo_id="$model_name",
+    local_dir="$local_dir",
+    token=token
+)
+print("Download complete!")
+EOF
     
-    if [[ -n "$HF_TOKEN" ]]; then
-        args+=(--token "$HF_TOKEN")
-    fi
-    
-    if huggingface-cli "${args[@]}"; then
+    if [[ $? -eq 0 ]]; then
         log_info "Successfully downloaded $model_name"
     else
         log_error "Failed to download $model_name"
@@ -106,8 +108,8 @@ show_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo
     echo "Options:"
-    echo "  --talker     Download only the Talker model (1.8GB)"
-    echo "  --tokenizer  Download only the Audio Tokenizer model (682MB)"
+    echo "  --talker     Download only the Talker model (~1.8GB)"
+    echo "  --tokenizer  Download only the Audio Tokenizer model (~682MB)"
     echo "  --all        Download all models (default)"
     echo "  --help       Show this help message"
     echo
@@ -118,6 +120,11 @@ show_usage() {
     echo "Models:"
     echo "  Talker:    $TALKER_MODEL (~1.8GB)"
     echo "  Tokenizer: $TOKENIZER_MODEL (~682MB)"
+    echo
+    echo "After download, run TTS with:"
+    echo "  cargo run --bin tts -- synth \"Hello\" -o out.wav \\"
+    echo "    --model-dir models/qwen3-tts-0.6b \\"
+    echo "    --codec-dir models/qwen3-tts-tokenizer"
 }
 
 main() {
@@ -159,12 +166,12 @@ main() {
     log_info "Models will be downloaded to: $MODELS_DIR"
     mkdir -p "$MODELS_DIR"
     
-    if $download_talker_flag; then
-        download_talker
-    fi
-    
     if $download_tokenizer_flag; then
         download_tokenizer
+    fi
+    
+    if $download_talker_flag; then
+        download_talker
     fi
     
     log_info "Done!"
@@ -176,6 +183,11 @@ main() {
     if $download_tokenizer_flag; then
         echo "  Tokenizer: $MODELS_DIR/qwen3-tts-tokenizer/"
     fi
+    echo
+    echo "Run TTS with:"
+    echo "  cargo run --bin tts -- synth \"Привет мир\" -o out.wav \\"
+    echo "    --model-dir $MODELS_DIR/qwen3-tts-0.6b \\"
+    echo "    --codec-dir $MODELS_DIR/qwen3-tts-tokenizer"
 }
 
 main "$@"
