@@ -4,12 +4,13 @@
 //! back to PCM waveform using a neural network architecture.
 //!
 //! The Qwen3-TTS-Tokenizer-12Hz decoder architecture:
-//! 1. **Quantizer dequantize**: tokens → latent embeddings
-//! 2. **Pre-Transformer**: 8-layer transformer with layer scale
-//! 3. **Upsample**: 2 ConvNeXt blocks with 2x upsampling each
-//! 4. **Pre-conv**: Conv1d projection
-//! 5. **HiFi-GAN decoder**: 4 upsample blocks with Snake activation
-//! 6. **Output**: Final conv to mono audio
+//! 1. **RVQ Dequantize**: tokens → embeddings via codebook lookup
+//! 2. **Output projection**: each codebook embedding projected to 512-dim
+//! 3. **Residual sum**: sum of all 16 projected embeddings
+//! 4. **Pre-conv**: Conv1d [1024, 512, 3] projection
+//! 5. **Pre-Transformer**: 8-layer causal transformer with layer scale
+//! 6. **HiFi-GAN decoder**: 4 upsample blocks with Snake activation
+//! 7. **Output**: Final conv to mono audio
 
 use std::path::Path;
 
@@ -399,19 +400,29 @@ impl UpsampleBlock {
 /// Neural decoder network for audio synthesis.
 ///
 /// Supports multi-codebook input from Qwen3-TTS-Tokenizer-12Hz.
-/// The decoder combines embeddings from all 16 codebooks and
-/// upsamples to produce 24kHz audio.
+/// The decoder uses RVQ dequantization with residual sum, then
+/// processes through Pre-Transformer and HiFi-GAN to produce audio.
 ///
-/// The decoder supports two modes:
-/// - **Legacy mode**: Uses simplified upsampling (when HiFi-GAN weights not available)
-/// - **HiFi-GAN mode**: Uses real Qwen3-TTS architecture with Snake activation
+/// Architecture:
+/// 1. RVQ dequantize: lookup embeddings from 16 codebooks
+/// 2. Output projection: project each embedding 256→512 and sum
+/// 3. Pre-conv: Conv1d [1024, 512, 3]
+/// 4. Pre-Transformer: 8-layer causal transformer
+/// 5. HiFi-GAN: 4 upsample blocks with Snake activation
+/// 6. Output: Conv1d to mono audio
 #[derive(Debug)]
 pub struct NeuralDecoder {
-    /// Codebook embeddings (one per quantizer).
+    /// Codebook embeddings (one per quantizer) [2048, 256].
     codebooks: Vec<Tensor>,
-    /// Projection from combined codebook embeddings to latent space.
-    embed_proj: Option<Conv1d>,
-    /// Initial projection.
+    /// RVQ output projection for first quantizer (256→512).
+    rvq_first_output_proj: Option<RvqOutputProj>,
+    /// RVQ output projection for rest quantizers (256→512).
+    rvq_rest_output_proj: Option<RvqOutputProj>,
+    /// Pre-conv: [1024, 512, 3] projects sum to 1024-dim.
+    pre_conv: Option<Conv1d>,
+    /// Pre-Transformer: 8-layer transformer.
+    pre_transformer: Option<PreTransformer>,
+    /// HiFi-GAN initial conv [1536, 1024, 7].
     input_conv: Conv1d,
     /// Upsampling stages (legacy mode).
     upsample_blocks: Vec<UpsampleBlock>,
@@ -425,8 +436,12 @@ pub struct NeuralDecoder {
     config: DecoderConfig,
     /// Device.
     device: Device,
+    /// Whether using full Qwen3 mode (with pre_transformer).
+    use_full_qwen3: bool,
     /// Whether using HiFi-GAN mode.
     use_hifi: bool,
+    /// Legacy projection from combined codebook embeddings.
+    embed_proj: Option<Conv1d>,
 }
 
 impl NeuralDecoder {
@@ -527,7 +542,21 @@ impl NeuralDecoder {
 
         Ok(Self {
             codebooks,
-            embed_proj,
+            rvq_first_output_proj: None,
+            rvq_rest_output_proj: None,
+            pre_conv: None,
+            pre_transformer: None,
+            embed_proj: Some(embed_proj.unwrap_or_else(|| {
+                // Fallback - create identity-like projection
+                let w = Tensor::zeros(
+                    (config.latent_dim, config.latent_dim, 1),
+                    DType::F32,
+                    device,
+                )
+                .unwrap();
+                let b = Tensor::zeros((config.latent_dim,), DType::F32, device).unwrap();
+                Conv1d::new(w, Some(b), Conv1dConfig::default())
+            })),
             input_conv,
             upsample_blocks,
             hifi_blocks: None,
@@ -535,6 +564,7 @@ impl NeuralDecoder {
             output_conv,
             config,
             device: device.clone(),
+            use_full_qwen3: false,
             use_hifi: false,
         })
     }
@@ -702,13 +732,9 @@ fn create_random_conv1d(
 impl NeuralDecoder {
     /// Create decoder from VarBuilder.
     ///
-    /// Loads 16 codebook embeddings and the upsampling network from weights.
-    /// Falls back to random initialization if weights aren't found (for testing).
+    /// Loads 16 codebook embeddings and the full Qwen3-TTS decoder architecture.
+    /// Falls back to legacy mode if pre_transformer weights aren't available.
     pub fn from_vb(vb: VarBuilder, config: DecoderConfig, device: &Device) -> TtsResult<Self> {
-        // Try to load real weights, but fall back to random init if structure doesn't match
-        // The Qwen3-TTS-Tokenizer has a different HiFi-GAN decoder architecture that we
-        // don't fully support yet. For now, we load codebooks and use simplified upsampling.
-
         // Load codebooks (one per quantizer)
         // Qwen3-TTS-Tokenizer-12Hz format:
         // - First quantizer: decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum
@@ -722,9 +748,9 @@ impl NeuralDecoder {
 
         // Determine actual codebook dimension from loaded tensors
         let actual_codebook_dim = if !codebooks.is_empty() {
-            codebooks[0].dim(1).unwrap_or(config.codebook_dim)
+            codebooks[0].dim(1).unwrap_or(256)
         } else {
-            config.codebook_dim
+            256 // Qwen3-TTS uses 256-dim codebook embeddings
         };
 
         info!(
@@ -734,33 +760,71 @@ impl NeuralDecoder {
             actual_codebook_dim
         );
 
-        // Combined embedding dimension using actual codebook dimension
-        let combined_dim = config.num_quantizers * actual_codebook_dim;
+        // Try to load RVQ output projections (256 → 512)
+        let rvq_first_output_proj =
+            RvqOutputProj::from_vb(vb.pp("decoder.quantizer.rvq_first.output_proj")).ok();
 
-        // Projection from combined embeddings to latent space
-        // Note: The Qwen3 model has a different architecture (HiFi-GAN based),
-        // so we use our own projection layer with random init for now.
-        let embed_proj = if combined_dim != config.latent_dim {
-            // Try to load from weights, fall back to random init
-            let proj = conv1d(
-                combined_dim,
-                config.latent_dim,
-                1,
-                Conv1dConfig::default(),
-                vb.pp("embed_proj"),
-            )
-            .or_else(|_| {
-                // Create random initialized layer
-                debug!("Using random init for embed_proj");
-                create_random_conv1d(combined_dim, config.latent_dim, 1, device)
+        let rvq_rest_output_proj =
+            RvqOutputProj::from_vb(vb.pp("decoder.quantizer.rvq_rest.output_proj")).ok();
+
+        let has_rvq_proj = rvq_first_output_proj.is_some() && rvq_rest_output_proj.is_some();
+        if has_rvq_proj {
+            debug!("Loaded RVQ output projections (256 → 512)");
+        }
+
+        // Try to load pre_conv: [1024, 512, 3]
+        let pre_conv = vb
+            .pp("decoder.pre_conv.conv")
+            .get((1024, 512, 3), "weight")
+            .and_then(|w| {
+                let b = vb.pp("decoder.pre_conv.conv").get((1024,), "bias")?;
+                Ok((w, b))
             })
-            .map_err(|e| TtsError::internal(format!("failed to create embed_proj: {e}")))?;
-            Some(proj)
+            .map(|(w, b)| {
+                Conv1d::new(
+                    w,
+                    Some(b),
+                    Conv1dConfig {
+                        padding: 1,
+                        ..Default::default()
+                    },
+                )
+            })
+            .ok();
+
+        if pre_conv.is_some() {
+            debug!("Loaded pre_conv [1024, 512, 3]");
+        }
+
+        // Try to load pre_transformer (8-layer transformer)
+        let pre_transformer =
+            PreTransformer::from_vb(vb.pp("decoder.pre_transformer"), &config, device).ok();
+
+        let use_full_qwen3 = pre_conv.is_some() && pre_transformer.is_some() && has_rvq_proj;
+        if use_full_qwen3 {
+            info!("Using full Qwen3-TTS decoder architecture");
+        } else {
+            debug!("Pre-transformer not fully loaded, will use legacy mode");
+        }
+
+        // Legacy embed_proj for fallback mode
+        let embed_proj = if !use_full_qwen3 {
+            let combined_dim = config.num_quantizers * actual_codebook_dim;
+            if combined_dim != config.latent_dim {
+                debug!("Using legacy embed_proj (random init)");
+                Some(
+                    create_random_conv1d(combined_dim, config.latent_dim, 1, device).map_err(
+                        |e| TtsError::internal(format!("failed to create embed_proj: {e}")),
+                    )?,
+                )
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        // Input projection - try Qwen3 format first, then our format, then random
+        // HiFi-GAN input conv: decoder.decoder.0 [1536, 1024, 7]
         let input_conv = vb
             .pp("decoder.decoder.0")
             .get((config.decoder_dim, config.latent_dim, 7), "conv.weight")
@@ -778,18 +842,6 @@ impl NeuralDecoder {
                         padding: 3,
                         ..Default::default()
                     },
-                )
-            })
-            .or_else(|_| {
-                conv1d(
-                    config.latent_dim,
-                    config.decoder_dim,
-                    7,
-                    Conv1dConfig {
-                        padding: 3,
-                        ..Default::default()
-                    },
-                    vb.pp("input_conv"),
                 )
             })
             .or_else(|_| {
@@ -908,7 +960,15 @@ impl NeuralDecoder {
             })
             .map_err(|e| TtsError::internal(format!("failed to create output_conv: {e}")))?;
 
-        if use_hifi {
+        if use_full_qwen3 && use_hifi {
+            info!(
+                "Decoder loaded (full Qwen3 mode): {} codebooks x {} entries, latent={}, upsample={}x, with pre_transformer",
+                config.num_quantizers,
+                config.codebook_size,
+                config.latent_dim,
+                config.total_upsample()
+            );
+        } else if use_hifi {
             info!(
                 "Decoder loaded (HiFi-GAN mode): {} codebooks x {} entries, latent={}, upsample={}x",
                 config.num_quantizers,
@@ -928,6 +988,10 @@ impl NeuralDecoder {
 
         Ok(Self {
             codebooks,
+            rvq_first_output_proj,
+            rvq_rest_output_proj,
+            pre_conv,
+            pre_transformer,
             embed_proj,
             input_conv,
             upsample_blocks,
@@ -936,6 +1000,7 @@ impl NeuralDecoder {
             output_conv,
             config,
             device: device.clone(),
+            use_full_qwen3,
             use_hifi,
         })
     }
@@ -1123,6 +1188,12 @@ impl NeuralDecoder {
         let seq_len = tokens[0].len();
 
         // Lookup embeddings from each codebook and concatenate
+        // Use full Qwen3 mode if available
+        if self.use_full_qwen3 {
+            return self.decode_qwen3_internal(tokens);
+        }
+
+        // Legacy mode: concatenate embeddings and project
         let mut embeddings_list = Vec::with_capacity(self.config.num_quantizers);
 
         for (i, (codebook, codebook_tokens)) in self.codebooks.iter().zip(tokens.iter()).enumerate()
@@ -1159,6 +1230,91 @@ impl NeuralDecoder {
         } else {
             x = self.decode_legacy(x)?;
         }
+
+        // Squeeze and convert to Vec
+        let x = x.squeeze(0)?.squeeze(0)?;
+        x.to_vec1()
+    }
+
+    /// Full Qwen3-TTS decoder pipeline.
+    ///
+    /// Architecture:
+    /// 1. RVQ dequantize: lookup embeddings from each codebook
+    /// 2. Output projection: project each embedding 256→512 via Conv1d
+    /// 3. Residual sum: sum all 16 projected embeddings
+    /// 4. Pre-conv: Conv1d [1024, 512, 3]
+    /// 5. Pre-Transformer: 8-layer causal transformer
+    /// 6. HiFi-GAN: 4 upsample blocks → audio
+    fn decode_qwen3_internal(&self, tokens: &[Vec<u32>]) -> CandleResult<Vec<f32>> {
+        let seq_len = tokens[0].len();
+        debug!(
+            "Qwen3 decode: {} codebooks x {} tokens",
+            tokens.len(),
+            seq_len
+        );
+
+        // Get required components
+        let rvq_first_proj = self.rvq_first_output_proj.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("rvq_first_output_proj not loaded".to_string())
+        })?;
+        let rvq_rest_proj = self.rvq_rest_output_proj.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("rvq_rest_output_proj not loaded".to_string())
+        })?;
+        let pre_conv = self
+            .pre_conv
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("pre_conv not loaded".to_string()))?;
+        let pre_transformer = self
+            .pre_transformer
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("pre_transformer not loaded".to_string()))?;
+
+        // Step 1 & 2: RVQ dequantize with output projection for each codebook
+        // Then sum all projected embeddings (residual sum)
+        let mut sum_embedding: Option<Tensor> = None;
+
+        for (i, (codebook, codebook_tokens)) in self.codebooks.iter().zip(tokens.iter()).enumerate()
+        {
+            let token_ids: Vec<i64> = codebook_tokens.iter().map(|&t| t as i64).collect();
+            let token_tensor = Tensor::new(token_ids.as_slice(), &self.device)?;
+
+            // Lookup: [seq_len, 256]
+            let emb = codebook.index_select(&token_tensor, 0)?;
+
+            // Add batch dimension: [1, seq_len, 256]
+            let emb = emb.unsqueeze(0)?;
+
+            // Output projection: [1, seq_len, 256] → [1, 512, seq_len]
+            let proj_emb = if i == 0 {
+                rvq_first_proj.forward(&emb)?
+            } else {
+                rvq_rest_proj.forward(&emb)?
+            };
+
+            // Residual sum
+            sum_embedding = match sum_embedding {
+                Some(s) => Some((s + proj_emb)?),
+                None => Some(proj_emb),
+            };
+        }
+
+        let x =
+            sum_embedding.ok_or_else(|| candle_core::Error::Msg("No embeddings".to_string()))?;
+        debug!("After RVQ sum: {:?}", x.dims());
+
+        // Step 3: Pre-conv [1024, 512, 3]
+        let x = pre_conv.forward(&x)?;
+        debug!("After pre_conv: {:?}", x.dims());
+
+        // Step 4: Pre-Transformer
+        let x = pre_transformer.forward(&x)?;
+        debug!("After pre_transformer: {:?}", x.dims());
+
+        // Step 5: HiFi-GAN decoder
+        let mut x = self.input_conv.forward(&x)?;
+        debug!("After input_conv: {:?}", x.dims());
+
+        x = self.decode_hifi_gan(x)?;
 
         // Squeeze and convert to Vec
         let x = x.squeeze(0)?.squeeze(0)?;
@@ -1297,6 +1453,367 @@ impl Snake {
         } else {
             Ok(activation)
         }
+    }
+}
+
+// =============================================================================
+// Pre-Transformer Components
+// =============================================================================
+
+/// RMS Layer Normalization.
+#[derive(Debug, Clone)]
+struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    fn from_vb(vb: VarBuilder, dim: usize, eps: f64) -> CandleResult<Self> {
+        let weight = vb.get((dim,), "weight")?;
+        Ok(Self { weight, eps })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, seq_len, hidden]
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+
+        // Compute RMS
+        let variance = x.sqr()?.mean_keepdim(2)?;
+        let rms = (variance + self.eps)?.sqrt()?;
+        let normalized = x.broadcast_div(&rms)?;
+
+        // Apply weight
+        let weight = self.weight.unsqueeze(0)?.unsqueeze(0)?;
+        normalized.broadcast_mul(&weight)?.to_dtype(dtype)
+    }
+}
+
+/// Layer Scale - learned per-channel scaling.
+#[derive(Debug, Clone)]
+struct LayerScale {
+    scale: Tensor,
+}
+
+impl LayerScale {
+    fn from_vb(vb: VarBuilder, dim: usize) -> CandleResult<Self> {
+        let scale = vb.get((dim,), "scale")?;
+        Ok(Self { scale })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let scale = self.scale.unsqueeze(0)?.unsqueeze(0)?;
+        x.broadcast_mul(&scale)
+    }
+}
+
+/// SwiGLU MLP block.
+#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
+struct MLP {
+    gate_proj: Tensor,
+    up_proj: Tensor,
+    down_proj: Tensor,
+}
+
+impl MLP {
+    fn from_vb(vb: VarBuilder, hidden_size: usize, intermediate_size: usize) -> CandleResult<Self> {
+        let gate_proj = vb.get((intermediate_size, hidden_size), "gate_proj.weight")?;
+        let up_proj = vb.get((intermediate_size, hidden_size), "up_proj.weight")?;
+        let down_proj = vb.get((hidden_size, intermediate_size), "down_proj.weight")?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, seq_len, hidden]
+        let (batch, seq_len, hidden_size) = x.dims3()?;
+        let _intermediate_size = self.gate_proj.dims()[0];
+
+        // Flatten for matmul
+        let x_flat = x.reshape((batch * seq_len, hidden_size))?;
+
+        let gate = x_flat.matmul(&self.gate_proj.t()?)?;
+        let up = x_flat.matmul(&self.up_proj.t()?)?;
+
+        // SwiGLU: silu(gate) * up
+        let gate_activated = candle_nn::ops::silu(&gate)?;
+        let hidden = (gate_activated * up)?;
+
+        let out = hidden.matmul(&self.down_proj.t()?)?;
+        out.reshape((batch, seq_len, hidden_size))
+    }
+}
+
+/// Self-attention block with separate kv_dim support.
+/// In Qwen3-TTS Pre-Transformer: hidden_size=512, kv_dim=1024, num_heads=16, head_dim=64
+#[derive(Debug)]
+struct SelfAttention {
+    q_proj: Tensor,
+    k_proj: Tensor,
+    v_proj: Tensor,
+    o_proj: Tensor,
+    num_heads: usize,
+    head_dim: usize,
+}
+
+impl SelfAttention {
+    /// Create from VarBuilder with explicit kv_dim (can differ from hidden_size)
+    fn from_vb(
+        vb: VarBuilder,
+        hidden_size: usize,
+        kv_dim: usize,
+        num_heads: usize,
+    ) -> CandleResult<Self> {
+        let head_dim = kv_dim / num_heads;
+
+        let q_proj = vb.get((kv_dim, hidden_size), "q_proj.weight")?;
+        let k_proj = vb.get((kv_dim, hidden_size), "k_proj.weight")?;
+        let v_proj = vb.get((kv_dim, hidden_size), "v_proj.weight")?;
+        let o_proj = vb.get((hidden_size, kv_dim), "o_proj.weight")?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_heads,
+            head_dim,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let (batch, seq_len, hidden) = x.dims3()?;
+        let kv_dim = self.num_heads * self.head_dim;
+
+        // Flatten for matmul: [batch * seq_len, hidden]
+        let x_flat = x.reshape((batch * seq_len, hidden))?;
+
+        // Project Q, K, V: [batch * seq_len, hidden] -> [batch * seq_len, kv_dim]
+        let q = x_flat.matmul(&self.q_proj.t()?)?;
+        let k = x_flat.matmul(&self.k_proj.t()?)?;
+        let v = x_flat.matmul(&self.v_proj.t()?)?;
+
+        // Reshape to [batch, seq_len, num_heads, head_dim], then transpose to [batch, num_heads, seq_len, head_dim]
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Scaled dot-product attention with causal mask
+        let scale = (self.head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+
+        // Causal mask
+        let mask = Self::causal_mask(seq_len, x.device())?;
+        let scores = scores.broadcast_add(&mask)?;
+
+        // Softmax and apply to values
+        let attn = candle_nn::ops::softmax(&scores, 3)?;
+        let out = attn.matmul(&v)?;
+
+        // Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, kv_dim]
+        let out = out.transpose(1, 2)?.reshape((batch, seq_len, kv_dim))?;
+
+        // Output projection: [batch, seq_len, kv_dim] -> [batch, seq_len, hidden]
+        let out_flat = out.reshape((batch * seq_len, kv_dim))?;
+        let result = out_flat.matmul(&self.o_proj.t()?)?;
+        result.reshape((batch, seq_len, hidden))
+    }
+
+    fn causal_mask(seq_len: usize, device: &Device) -> CandleResult<Tensor> {
+        let mut mask = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in (i + 1)..seq_len {
+                mask[i * seq_len + j] = f32::NEG_INFINITY;
+            }
+        }
+        Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)
+    }
+}
+
+/// Pre-Transformer layer with layer scale.
+#[derive(Debug)]
+struct PreTransformerLayer {
+    input_layernorm: RmsNorm,
+    self_attn: SelfAttention,
+    self_attn_layer_scale: LayerScale,
+    post_attention_layernorm: RmsNorm,
+    mlp: MLP,
+    mlp_layer_scale: LayerScale,
+}
+
+impl PreTransformerLayer {
+    fn from_vb(
+        vb: VarBuilder,
+        hidden_size: usize,
+        kv_dim: usize,
+        intermediate_size: usize,
+        num_heads: usize,
+        eps: f64,
+    ) -> CandleResult<Self> {
+        let input_layernorm = RmsNorm::from_vb(vb.pp("input_layernorm"), hidden_size, eps)?;
+        let self_attn = SelfAttention::from_vb(vb.pp("self_attn"), hidden_size, kv_dim, num_heads)?;
+        let self_attn_layer_scale =
+            LayerScale::from_vb(vb.pp("self_attn_layer_scale"), hidden_size)?;
+        let post_attention_layernorm =
+            RmsNorm::from_vb(vb.pp("post_attention_layernorm"), hidden_size, eps)?;
+        let mlp = MLP::from_vb(vb.pp("mlp"), hidden_size, intermediate_size)?;
+        let mlp_layer_scale = LayerScale::from_vb(vb.pp("mlp_layer_scale"), hidden_size)?;
+
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            self_attn_layer_scale,
+            post_attention_layernorm,
+            mlp,
+            mlp_layer_scale,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // Self-attention with residual
+        let residual = x.clone();
+        let x = self.input_layernorm.forward(x)?;
+        let x = self.self_attn.forward(&x)?;
+        let x = self.self_attn_layer_scale.forward(&x)?;
+        let x = (residual + x)?;
+
+        // MLP with residual
+        let residual = x.clone();
+        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.mlp.forward(&x)?;
+        let x = self.mlp_layer_scale.forward(&x)?;
+        residual + x
+    }
+}
+
+/// Pre-Transformer module.
+///
+/// This is the transformer that processes the quantizer output before HiFi-GAN.
+/// Structure: input_proj -> layers -> output_proj
+#[derive(Debug)]
+struct PreTransformer {
+    input_proj: Tensor,
+    input_proj_bias: Tensor,
+    layers: Vec<PreTransformerLayer>,
+    output_proj: Tensor,
+    output_proj_bias: Tensor,
+}
+
+impl PreTransformer {
+    fn from_vb(vb: VarBuilder, config: &DecoderConfig, _device: &Device) -> CandleResult<Self> {
+        // input_proj: [512, 1024] - projects from 1024 (pre_conv output) to 512 (hidden)
+        let input_proj = vb.get((512, 1024), "input_proj.weight")?;
+        let input_proj_bias = vb.get((512,), "input_proj.bias")?;
+
+        // Load transformer layers
+        // Qwen3-TTS Pre-Transformer: hidden_size=512, kv_dim=1024, intermediate=1024, 16 heads
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            match PreTransformerLayer::from_vb(
+                vb.pp(format!("layers.{}", i)),
+                512,  // hidden_size
+                1024, // kv_dim (num_heads * head_dim = 16 * 64 = 1024)
+                1024, // intermediate_size
+                16,   // num_heads
+                config.rms_norm_eps,
+            ) {
+                Ok(layer) => layers.push(layer),
+                Err(e) => {
+                    debug!("Failed to load pre_transformer layer {}: {}", i, e);
+                    return Err(e);
+                }
+            }
+        }
+
+        // output_proj: [1024, 512] - projects from 512 back to 1024
+        let output_proj = vb.get((1024, 512), "output_proj.weight")?;
+        let output_proj_bias = vb.get((1024,), "output_proj.bias")?;
+
+        info!("Loaded PreTransformer with {} layers", layers.len());
+
+        Ok(Self {
+            input_proj,
+            input_proj_bias,
+            layers,
+            output_proj,
+            output_proj_bias,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, channels=1024, seq_len]
+        // Transpose to [batch, seq_len, channels] for transformer
+        let x = x.transpose(1, 2)?;
+        let (batch, seq_len, _) = x.dims3()?;
+
+        // Input projection: [batch, seq_len, 1024] -> [batch, seq_len, 512]
+        // Reshape for matmul compatibility
+        let x_flat = x.reshape((batch * seq_len, 1024))?;
+        let x_proj = x_flat.matmul(&self.input_proj.t()?)?;
+        let x = x_proj.reshape((batch, seq_len, 512))?;
+        let bias = self.input_proj_bias.unsqueeze(0)?.unsqueeze(0)?;
+        let mut x = x.broadcast_add(&bias)?;
+
+        // Transformer layers
+        for layer in &self.layers {
+            x = layer.forward(&x)?;
+        }
+
+        // Output projection: [batch, seq_len, 512] -> [batch, seq_len, 1024]
+        let (batch, seq_len, _) = x.dims3()?;
+        let x_flat = x.reshape((batch * seq_len, 512))?;
+        let x_proj = x_flat.matmul(&self.output_proj.t()?)?;
+        let x = x_proj.reshape((batch, seq_len, 1024))?;
+        let bias = self.output_proj_bias.unsqueeze(0)?.unsqueeze(0)?;
+        let x = x.broadcast_add(&bias)?;
+
+        // Transpose back to [batch, channels=1024, seq_len]
+        x.transpose(1, 2)
+    }
+}
+
+// =============================================================================
+// RVQ Components
+// =============================================================================
+
+/// RVQ output projection (Conv1d 1x1).
+/// Projects codebook embeddings from 256 to 512 dimensions.
+#[derive(Debug)]
+struct RvqOutputProj {
+    weight: Tensor,
+}
+
+impl RvqOutputProj {
+    fn from_vb(vb: VarBuilder) -> CandleResult<Self> {
+        // Weight shape: [512, 256, 1] (out_channels, in_channels, kernel_size)
+        let weight = vb.get((512, 256, 1), "weight")?;
+        Ok(Self { weight })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, seq_len, 256]
+        // Conv1d with kernel_size=1 is equivalent to a linear projection
+        // weight: [512, 256, 1]
+        let weight = self.weight.squeeze(2)?; // [512, 256]
+
+        // For 3D input, we need to use broadcast_matmul or reshape
+        // x: [batch, seq_len, 256], weight.t(): [256, 512]
+        // Result: [batch, seq_len, 512]
+        let (batch, seq_len, _in_dim) = x.dims3()?;
+        let x_flat = x.reshape((batch * seq_len, 256))?; // [batch*seq_len, 256]
+        let out_flat = x_flat.matmul(&weight.t()?)?; // [batch*seq_len, 512]
+        let out = out_flat.reshape((batch, seq_len, 512))?; // [batch, seq_len, 512]
+        out.transpose(1, 2) // [batch, 512, seq_len]
     }
 }
 
