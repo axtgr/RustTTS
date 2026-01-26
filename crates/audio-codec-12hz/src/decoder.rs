@@ -2306,27 +2306,41 @@ impl ConvNeXtUpsampleBlock {
 ///
 /// Structure from Qwen3-TTS-Tokenizer:
 /// - Snake activation (act1)
-/// - Conv1d
+/// - CausalConv1d with dilation
 /// - Snake activation (act2)
-/// - Conv1d
+/// - CausalConv1d (1x1)
 /// - Residual connection
 #[derive(Debug)]
 struct HifiResBlock {
     act1: Snake,
     conv1: Conv1d,
+    conv1_padding: usize, // Causal padding for conv1
     act2: Snake,
     conv2: Conv1d,
+    conv2_padding: usize, // Causal padding for conv2
 }
 
 impl HifiResBlock {
     /// Load from VarBuilder (Qwen3 format).
-    fn from_vb(vb: VarBuilder, channels: usize, kernel_size: usize) -> CandleResult<Self> {
+    ///
+    /// `dilation` should be 1, 3, or 9 for the three residual blocks in each HiFi-GAN stage.
+    fn from_vb(
+        vb: VarBuilder,
+        channels: usize,
+        kernel_size: usize,
+        dilation: usize,
+    ) -> CandleResult<Self> {
         let act1 = Snake::from_vb(vb.pp("act1"), channels)?;
         let act2 = Snake::from_vb(vb.pp("act2"), channels)?;
 
-        let padding = kernel_size / 2;
+        // CausalConvNet padding: (kernel_size - 1) * dilation (left padding only)
+        // For inference, we use symmetric padding in Conv1d and then trim
+        let effective_kernel = (kernel_size - 1) * dilation + 1;
+        let conv1_padding = effective_kernel - 1; // Causal: all padding on left
+
         let conv1_cfg = Conv1dConfig {
-            padding,
+            padding: 0, // We'll apply causal padding manually
+            dilation,
             ..Default::default()
         };
         let conv1 = conv1d(
@@ -2337,7 +2351,8 @@ impl HifiResBlock {
             vb.pp("conv1.conv"),
         )?;
 
-        // Second conv is typically 1x1 projection
+        // Second conv is 1x1 projection (no dilation needed)
+        let conv2_padding = 0; // 1x1 conv needs no padding
         let conv2 = conv1d(
             channels,
             channels,
@@ -2349,24 +2364,34 @@ impl HifiResBlock {
         Ok(Self {
             act1,
             conv1,
+            conv1_padding,
             act2,
             conv2,
+            conv2_padding,
         })
     }
 
     /// Create with random initialization.
-    fn new_random(channels: usize, kernel_size: usize, device: &Device) -> CandleResult<Self> {
+    fn new_random(
+        channels: usize,
+        kernel_size: usize,
+        dilation: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
         let act1 = Snake::new_random(channels, device)?;
         let act2 = Snake::new_random(channels, device)?;
 
-        let padding = kernel_size / 2;
+        let effective_kernel = (kernel_size - 1) * dilation + 1;
+        let conv1_padding = effective_kernel - 1;
+
         let w1 = Tensor::randn(0.0f32, 0.02, (channels, channels, kernel_size), device)?;
         let b1 = Tensor::zeros((channels,), DType::F32, device)?;
         let conv1 = Conv1d::new(
             w1,
             Some(b1),
             Conv1dConfig {
-                padding,
+                padding: 0,
+                dilation,
                 ..Default::default()
             },
         );
@@ -2374,24 +2399,61 @@ impl HifiResBlock {
         let w2 = Tensor::randn(0.0f32, 0.02, (channels, channels, 1), device)?;
         let b2 = Tensor::zeros((channels,), DType::F32, device)?;
         let conv2 = Conv1d::new(w2, Some(b2), Conv1dConfig::default());
+        let conv2_padding = 0;
 
         Ok(Self {
             act1,
             conv1,
+            conv1_padding,
             act2,
             conv2,
+            conv2_padding,
         })
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let residual = x.clone();
 
+        // Apply Snake activation 1
         let x = self.act1.forward(x)?;
+
+        // Apply causal padding (left padding only) for conv1
+        let x = if self.conv1_padding > 0 {
+            x.pad_with_zeros(2, self.conv1_padding, 0)?
+        } else {
+            x
+        };
         let x = self.conv1.forward(&x)?;
+
+        // Apply Snake activation 2
         let x = self.act2.forward(&x)?;
+
+        // Apply causal padding for conv2 (usually 0 for 1x1 conv)
+        let x = if self.conv2_padding > 0 {
+            x.pad_with_zeros(2, self.conv2_padding, 0)?
+        } else {
+            x
+        };
         let x = self.conv2.forward(&x)?;
 
-        x + residual
+        // Residual connection - ensure same length
+        // Causal conv may produce different length, need to align
+        let res_len = residual.dim(2)?;
+        let out_len = x.dim(2)?;
+
+        if out_len == res_len {
+            x + residual
+        } else if out_len > res_len {
+            // Trim output to match residual (take last res_len samples)
+            let start = out_len - res_len;
+            x.narrow(2, start, res_len)? + residual
+        } else {
+            // This shouldn't happen with proper causal padding
+            Err(candle_core::Error::Msg(format!(
+                "Output length {} < residual length {}",
+                out_len, res_len
+            )))?
+        }
     }
 }
 
@@ -2399,12 +2461,14 @@ impl HifiResBlock {
 ///
 /// Structure from Qwen3-TTS-Tokenizer (decoder.decoder.{1-4}):
 /// - Snake activation (block.0)
-/// - ConvTranspose1d for upsampling (block.1.conv)
+/// - CausalConvTranspose1d for upsampling (block.1.conv) with trimming
 /// - 3 residual blocks (block.2, block.3, block.4)
 #[derive(Debug)]
 struct HifiUpsampleBlock {
     snake: Snake,
     upsample_conv: ConvTranspose1d,
+    /// Trimming for causal conv transpose: (left_pad, right_pad)
+    upsample_trim: (usize, usize),
     res_blocks: Vec<HifiResBlock>,
 }
 
@@ -2424,13 +2488,21 @@ impl HifiUpsampleBlock {
         let snake = Snake::from_vb(vb.pp("block.0"), in_channels)
             .or_else(|_| Snake::new_random(in_channels, device))?;
 
-        // Upsample conv (transposed convolution)
-        let padding = (kernel_size - upsample_factor) / 2;
+        // Upsample conv (transposed convolution) - CausalConvTranspose style
+        // Python: pad = kernel_size - stride; left_pad = ceil(pad); right_pad = left_pad
+        // We use no padding in conv and manually trim the output
         let conv_cfg = ConvTranspose1dConfig {
             stride: upsample_factor,
-            padding,
+            padding: 0, // No padding, we trim manually
             ..Default::default()
         };
+
+        // Calculate trim amounts (matching Python CausalTransConvNet)
+        let pad = kernel_size.saturating_sub(upsample_factor);
+        let left_pad = (pad + 1) / 2; // ceil(pad / 2)
+        let right_pad = left_pad;
+        let upsample_trim = (left_pad, right_pad);
+
         let upsample_conv = conv_transpose1d(
             in_channels,
             out_channels,
@@ -2450,17 +2522,21 @@ impl HifiUpsampleBlock {
             Ok(ConvTranspose1d::new(w, Some(b), conv_cfg))
         })?;
 
-        // Residual blocks
+        // Residual blocks with dilations (1, 3, 9)
+        let dilations = [1usize, 3, 9];
         let mut res_blocks = Vec::with_capacity(num_res_blocks);
         for i in 0..num_res_blocks {
-            let block = HifiResBlock::from_vb(vb.pp(format!("block.{}", i + 2)), out_channels, 7)
-                .or_else(|_| HifiResBlock::new_random(out_channels, 7, device))?;
+            let dilation = dilations.get(i).copied().unwrap_or(1);
+            let block =
+                HifiResBlock::from_vb(vb.pp(format!("block.{}", i + 2)), out_channels, 7, dilation)
+                    .or_else(|_| HifiResBlock::new_random(out_channels, 7, dilation, device))?;
             res_blocks.push(block);
         }
 
         Ok(Self {
             snake,
             upsample_conv,
+            upsample_trim,
             res_blocks,
         })
     }
@@ -2477,7 +2553,12 @@ impl HifiUpsampleBlock {
     ) -> CandleResult<Self> {
         let snake = Snake::new_random(in_channels, device)?;
 
-        let padding = (kernel_size - upsample_factor) / 2;
+        // Calculate trim amounts (matching Python CausalTransConvNet)
+        let pad = kernel_size.saturating_sub(upsample_factor);
+        let left_pad = (pad + 1) / 2;
+        let right_pad = left_pad;
+        let upsample_trim = (left_pad, right_pad);
+
         let w = Tensor::randn(
             0.0f32,
             0.02,
@@ -2487,19 +2568,22 @@ impl HifiUpsampleBlock {
         let b = Tensor::zeros((out_channels,), DType::F32, device)?;
         let conv_cfg = ConvTranspose1dConfig {
             stride: upsample_factor,
-            padding,
+            padding: 0,
             ..Default::default()
         };
         let upsample_conv = ConvTranspose1d::new(w, Some(b), conv_cfg);
 
+        let dilations = [1usize, 3, 9];
         let mut res_blocks = Vec::with_capacity(num_res_blocks);
-        for _ in 0..num_res_blocks {
-            res_blocks.push(HifiResBlock::new_random(out_channels, 7, device)?);
+        for i in 0..num_res_blocks {
+            let dilation = dilations.get(i).copied().unwrap_or(1);
+            res_blocks.push(HifiResBlock::new_random(out_channels, 7, dilation, device)?);
         }
 
         Ok(Self {
             snake,
             upsample_conv,
+            upsample_trim,
             res_blocks,
         })
     }
@@ -2508,6 +2592,17 @@ impl HifiUpsampleBlock {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let x = self.snake.forward(x)?;
         let mut x = self.upsample_conv.forward(&x)?;
+
+        // Apply causal trimming (matching Python CausalTransConvNet)
+        let (left_trim, right_trim) = self.upsample_trim;
+        if left_trim > 0 || right_trim > 0 {
+            let len = x.dim(2)?;
+            let start = left_trim;
+            let new_len = len.saturating_sub(left_trim + right_trim);
+            if new_len > 0 {
+                x = x.narrow(2, start, new_len)?;
+            }
+        }
 
         for block in &self.res_blocks {
             x = block.forward(&x)?;
