@@ -10,6 +10,12 @@ use crate::config::AcousticModelConfig;
 use crate::layers::{RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
 use crate::sampling::{Sampler, SamplingConfig};
 
+/// KV cache type alias for transformer layers.
+pub type KvCache = Vec<(Tensor, Tensor)>;
+
+/// Forward output with hidden states: (logits, hidden_states, kv_caches).
+pub type ForwardWithHiddenOutput = (Tensor, Tensor, KvCache);
+
 /// The main acoustic model for Qwen3-TTS (Talker).
 ///
 /// Qwen3-TTS architecture has:
@@ -278,6 +284,29 @@ impl Model {
         position_offset: usize,
         kv_caches: Option<&[(Tensor, Tensor)]>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        let (logits, _, new_kv_caches) =
+            self.forward_mixed_with_hidden(text_ids, codec_ids, position_offset, kv_caches)?;
+        Ok((logits, new_kv_caches))
+    }
+
+    /// Forward pass that also returns hidden states (before codec_head).
+    ///
+    /// This is needed for CodePredictor which uses the hidden states
+    /// to predict residual codebooks (1-15).
+    ///
+    /// # Returns
+    /// Tuple of (logits, hidden_states, kv_caches)
+    /// - logits: [batch, seq_len, codec_vocab_size]
+    /// - hidden_states: [batch, seq_len, hidden_size] - after final norm
+    /// - kv_caches: Updated KV caches for each layer
+    #[instrument(skip(self, text_ids, codec_ids, kv_caches))]
+    pub fn forward_mixed_with_hidden(
+        &self,
+        text_ids: Option<&Tensor>,
+        codec_ids: Option<&Tensor>,
+        position_offset: usize,
+        kv_caches: Option<&[(Tensor, Tensor)]>,
+    ) -> Result<ForwardWithHiddenOutput> {
         // Embed tokens based on type
         let hidden_states = match (text_ids, codec_ids) {
             (Some(text), None) => self.embed_text(text)?,
@@ -315,12 +344,13 @@ impl Model {
         // Project to codec vocabulary
         let logits = self.codec_head.forward(&hidden_states)?;
 
-        Ok((logits, new_kv_caches))
+        Ok((logits, hidden_states, new_kv_caches))
     }
 
     /// Generate acoustic tokens autoregressively from text tokens.
     ///
     /// Uses forward_mixed to properly handle text prefill and codec generation.
+    /// Returns only the zeroth codebook tokens.
     #[instrument(skip(self, text_ids, sampling_config))]
     pub fn generate(
         &self,
@@ -329,18 +359,43 @@ impl Model {
         sampling_config: SamplingConfig,
         eos_token_id: Option<u32>,
     ) -> Result<Vec<u32>> {
+        let (tokens, _) =
+            self.generate_with_hidden(text_ids, max_new_tokens, sampling_config, eos_token_id)?;
+        Ok(tokens)
+    }
+
+    /// Generate acoustic tokens and return hidden states for CodePredictor.
+    ///
+    /// This method generates zeroth codebook tokens and also returns the
+    /// hidden states from each generation step, which can be used by
+    /// CodePredictor to predict residual codebooks (1-15).
+    ///
+    /// # Returns
+    /// Tuple of (tokens, hidden_states)
+    /// - tokens: Vec<u32> - generated zeroth codebook tokens
+    /// - hidden_states: Tensor [1, num_tokens, hidden_size] - concatenated hidden states
+    #[instrument(skip(self, text_ids, sampling_config))]
+    pub fn generate_with_hidden(
+        &self,
+        text_ids: &[u32],
+        max_new_tokens: usize,
+        sampling_config: SamplingConfig,
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, Tensor)> {
         info!(
-            "Generating up to {} tokens from {} text tokens",
+            "Generating up to {} tokens from {} text tokens (with hidden states)",
             max_new_tokens,
             text_ids.len()
         );
 
         let mut sampler = Sampler::new(sampling_config);
         let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut all_hidden_states: Vec<Tensor> = Vec::with_capacity(max_new_tokens);
 
         // Prefill with text tokens
         let text_tensor = Tensor::new(text_ids, &self.device)?.unsqueeze(0)?; // [1, seq_len]
-        let (logits, new_kv_caches) = self.forward_mixed(Some(&text_tensor), None, 0, None)?;
+        let (logits, hidden_states, new_kv_caches) =
+            self.forward_mixed_with_hidden(Some(&text_tensor), None, 0, None)?;
 
         let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(new_kv_caches);
         let mut position_offset = text_ids.len();
@@ -353,9 +408,17 @@ impl Model {
         // Check for EOS
         if Some(current_token) == eos_token_id {
             info!("EOS token generated at prefill");
-            return Ok(generated);
+            // Return empty hidden states
+            let empty_hidden =
+                Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?;
+            return Ok((generated, empty_hidden));
         }
         generated.push(current_token);
+
+        // Store hidden state for this position (last position from prefill)
+        let last_hidden =
+            hidden_states.i((.., hidden_states.dim(1)? - 1..hidden_states.dim(1)?, ..))?;
+        all_hidden_states.push(last_hidden);
 
         // Generate remaining tokens
         for step in 1..max_new_tokens {
@@ -363,12 +426,15 @@ impl Model {
             let codec_tensor = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
 
             // Forward pass with codec token
-            let (logits, new_kv_caches) = self.forward_mixed(
+            let (logits, hidden_states, new_kv_caches) = self.forward_mixed_with_hidden(
                 None,
                 Some(&codec_tensor),
                 position_offset,
                 kv_caches.as_deref(),
             )?;
+
+            // Store hidden state for this step
+            all_hidden_states.push(hidden_states.clone());
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -393,7 +459,17 @@ impl Model {
         }
 
         info!("Generated {} tokens", generated.len());
-        Ok(generated)
+
+        // Concatenate all hidden states: [1, num_tokens, hidden_size]
+        let concatenated_hidden = if all_hidden_states.is_empty() {
+            Tensor::zeros((1, 0, self.config.hidden_size), DType::F32, &self.device)?
+        } else {
+            Tensor::cat(&all_hidden_states, 1)?
+        };
+
+        debug!("Hidden states shape: {:?}", concatenated_hidden.dims());
+
+        Ok((generated, concatenated_hidden))
     }
 }
 

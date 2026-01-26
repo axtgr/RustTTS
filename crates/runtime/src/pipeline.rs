@@ -8,7 +8,7 @@ use std::sync::Arc;
 use candle_core::Device;
 use tracing::{debug, info, instrument};
 
-use acoustic_model::{Model as AcousticModel, SamplingConfig};
+use acoustic_model::{CodePredictor, CodePredictorConfig, Model as AcousticModel, SamplingConfig};
 use audio_codec_12hz::{Codec12Hz, DEFAULT_CROSSFADE_MS, StreamingDecoder};
 use text_normalizer::Normalizer;
 use text_tokenizer::{MockTokenizer, Qwen3TTSTokens, Tokenizer};
@@ -90,15 +90,24 @@ impl std::fmt::Debug for TokenizerBackend {
 enum AcousticBackend {
     /// Mock acoustic generation (no model weights needed).
     Mock,
-    /// Real neural acoustic model.
-    Neural(Arc<AcousticModel>),
+    /// Real neural acoustic model with optional CodePredictor.
+    Neural {
+        model: Arc<AcousticModel>,
+        code_predictor: Option<Arc<CodePredictor>>,
+    },
 }
 
 impl std::fmt::Debug for AcousticBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Mock => write!(f, "MockAcoustic"),
-            Self::Neural(_) => write!(f, "NeuralAcoustic"),
+            Self::Neural { code_predictor, .. } => {
+                if code_predictor.is_some() {
+                    write!(f, "NeuralAcoustic(with CodePredictor)")
+                } else {
+                    write!(f, "NeuralAcoustic(zeroth only)")
+                }
+            }
         }
     }
 }
@@ -188,7 +197,15 @@ impl TtsPipeline {
                         hidden = model.config().hidden_size,
                         "Acoustic model loaded"
                     );
-                    AcousticBackend::Neural(Arc::new(model))
+
+                    // Try to load CodePredictor from the same weights file
+                    let code_predictor =
+                        Self::try_load_code_predictor(&weights_path, model.config(), device);
+
+                    AcousticBackend::Neural {
+                        model: Arc::new(model),
+                        code_predictor,
+                    }
                 }
                 Err(e) => {
                     info!("Failed to load acoustic model: {}, using mock", e);
@@ -213,6 +230,46 @@ impl TtsPipeline {
             special_tokens: Qwen3TTSTokens::default(),
             device: device.clone(),
         })
+    }
+
+    /// Try to load CodePredictor from the same weights file as the main model.
+    fn try_load_code_predictor(
+        weights_path: &Path,
+        model_config: &acoustic_model::AcousticModelConfig,
+        device: &Device,
+    ) -> Option<Arc<CodePredictor>> {
+        // Create CodePredictor config from main model config
+        let cp_config = CodePredictorConfig {
+            hidden_size: model_config.hidden_size,
+            num_layers: 5, // Qwen3-TTS CodePredictor has 5 layers
+            num_attention_heads: model_config.num_attention_heads,
+            num_kv_heads: model_config.num_kv_heads,
+            intermediate_size: model_config.intermediate_size,
+            head_dim: model_config.head_dim,
+            num_code_groups: model_config.num_code_groups,
+            codebook_size: model_config.codebook_size,
+            max_position_embeddings: model_config.max_position_embeddings,
+            rope_theta: model_config.rope_theta,
+            rms_norm_eps: model_config.rms_norm_eps,
+        };
+
+        match CodePredictor::load(weights_path, cp_config, device) {
+            Ok(cp) => {
+                info!(
+                    "CodePredictor loaded: {} layers, {} residual codebooks",
+                    5,
+                    model_config.num_code_groups - 1
+                );
+                Some(Arc::new(cp))
+            }
+            Err(e) => {
+                info!(
+                    "CodePredictor not found or failed to load: {}, will use zeroth codebook only",
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Create a neural pipeline with loaded models (legacy API).
@@ -257,7 +314,18 @@ impl TtsPipeline {
 
     /// Check if using real (non-mock) acoustic model.
     pub fn has_real_acoustic(&self) -> bool {
-        matches!(self.acoustic, AcousticBackend::Neural(_))
+        matches!(self.acoustic, AcousticBackend::Neural { .. })
+    }
+
+    /// Check if CodePredictor is loaded for multi-codebook generation.
+    pub fn has_code_predictor(&self) -> bool {
+        matches!(
+            &self.acoustic,
+            AcousticBackend::Neural {
+                code_predictor: Some(_),
+                ..
+            }
+        )
     }
 
     /// Check if using real (non-mock) codec.
@@ -278,23 +346,35 @@ impl TtsPipeline {
     /// Generate acoustic tokens from text tokens.
     ///
     /// Uses real acoustic model if available, otherwise falls back to mock.
+    /// If CodePredictor is available, generates all 16 codebooks;
+    /// otherwise, generates only the zeroth codebook.
     pub fn generate_acoustic(&self, text_tokens: &[u32], max_tokens: usize) -> TtsResult<Vec<u32>> {
         if text_tokens.is_empty() {
             return Err(TtsError::invalid_input("empty text tokens"));
         }
 
         match &self.acoustic {
-            AcousticBackend::Neural(model) => {
-                self.generate_acoustic_neural(model, text_tokens, max_tokens)
-            }
+            AcousticBackend::Neural {
+                model,
+                code_predictor,
+            } => self.generate_acoustic_neural(
+                model,
+                code_predictor.as_deref(),
+                text_tokens,
+                max_tokens,
+            ),
             AcousticBackend::Mock => self.generate_acoustic_mock(text_tokens, max_tokens),
         }
     }
 
     /// Generate acoustic tokens using the neural model.
+    ///
+    /// If CodePredictor is provided, generates all 16 codebooks and returns
+    /// them in interleaved format. Otherwise, returns only zeroth codebook.
     fn generate_acoustic_neural(
         &self,
         model: &AcousticModel,
+        code_predictor: Option<&CodePredictor>,
         text_tokens: &[u32],
         max_tokens: usize,
     ) -> TtsResult<Vec<u32>> {
@@ -308,6 +388,7 @@ impl TtsPipeline {
         debug!(
             input_len = input_ids.len(),
             max_tokens = max_tokens,
+            has_code_predictor = code_predictor.is_some(),
             "Starting neural acoustic generation"
         );
 
@@ -319,22 +400,67 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Generate acoustic tokens
-        let acoustic_tokens = model
-            .generate(
+        // Generate zeroth codebook tokens with hidden states
+        let (zeroth_tokens, hidden_states) = model
+            .generate_with_hidden(
                 &input_ids,
                 max_tokens,
-                sampling_config,
+                sampling_config.clone(),
                 Some(self.special_tokens.codec_eos_id),
             )
             .map_err(|e| TtsError::inference(format!("acoustic generation failed: {e}")))?;
 
         debug!(
-            output_tokens = acoustic_tokens.len(),
-            "Neural acoustic generation complete"
+            zeroth_tokens = zeroth_tokens.len(),
+            hidden_shape = ?hidden_states.dims(),
+            "Zeroth codebook generation complete"
         );
 
-        Ok(acoustic_tokens)
+        // If no CodePredictor, return only zeroth codebook
+        let Some(cp) = code_predictor else {
+            debug!("No CodePredictor, returning zeroth codebook only");
+            return Ok(zeroth_tokens);
+        };
+
+        // Use CodePredictor to generate residual codebooks (1-15)
+        if zeroth_tokens.is_empty() {
+            debug!("No tokens generated, returning empty");
+            return Ok(zeroth_tokens);
+        }
+
+        // Create tensor from zeroth codebook tokens
+        let zeroth_tensor = candle_core::Tensor::new(zeroth_tokens.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        // Predict all codebooks using CodePredictor
+        let all_codes = cp
+            .predict_from_hidden(&hidden_states, &zeroth_tensor, sampling_config)
+            .map_err(|e| TtsError::inference(format!("code prediction failed: {e}")))?;
+
+        // Convert to interleaved format: [frame0_code0, frame0_code1, ..., frame1_code0, ...]
+        let (_, num_frames, num_groups) = all_codes
+            .dims3()
+            .map_err(|e| TtsError::inference(format!("dims3 failed: {e}")))?;
+
+        let all_codes_flat: Vec<u32> = all_codes
+            .squeeze(0)
+            .map_err(|e| TtsError::inference(format!("squeeze failed: {e}")))?
+            .to_vec2()
+            .map_err(|e| TtsError::inference(format!("to_vec2 failed: {e}")))?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        debug!(
+            num_frames = num_frames,
+            num_groups = num_groups,
+            total_codes = all_codes_flat.len(),
+            "Multi-codebook generation complete"
+        );
+
+        Ok(all_codes_flat)
     }
 
     /// Generate mock acoustic tokens (for testing without model weights).
