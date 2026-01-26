@@ -167,6 +167,34 @@ impl Codec12Hz {
     }
 }
 
+impl Codec12Hz {
+    /// Decode multi-codebook tokens to audio.
+    ///
+    /// # Arguments
+    /// * `tokens` - 2D array of shape `[num_quantizers, seq_len]` where each row
+    ///   contains tokens from one codebook.
+    ///
+    /// # Returns
+    /// AudioChunk with decoded PCM samples.
+    pub fn decode_multi(&self, tokens: &[Vec<u32>]) -> TtsResult<AudioChunk> {
+        if tokens.is_empty() || tokens[0].is_empty() {
+            return Err(TtsError::invalid_input("empty token sequence"));
+        }
+
+        let pcm = match &self.backend {
+            DecoderBackend::Neural(decoder) => decoder.decode_multi(tokens)?,
+            DecoderBackend::Mock(decoder) => {
+                // Mock decoder uses only first codebook
+                decoder.decode(&tokens[0])?
+            }
+        };
+
+        let duration_ms = (pcm.len() as f32 / self.sample_rate as f32) * 1000.0;
+
+        Ok(AudioChunk::new(pcm, self.sample_rate, 0.0, duration_ms))
+    }
+}
+
 impl AudioCodec for Codec12Hz {
     fn decode(&self, tokens: &[u32]) -> TtsResult<AudioChunk> {
         if tokens.is_empty() {

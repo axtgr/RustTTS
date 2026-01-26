@@ -26,6 +26,8 @@ pub struct SynthOptions {
     /// Random seed for reproducible generation (reserved for future use).
     #[allow(dead_code)]
     pub seed: Option<u64>,
+    /// Use multi-codebook decoding (all 16 codebooks via CodePredictor).
+    pub multi_codebook: bool,
 }
 
 /// Create pipeline based on options.
@@ -88,6 +90,7 @@ pub async fn run(options: SynthOptions) -> Result<()> {
         lang = %lang,
         output = %options.output.display(),
         speaker = ?options.speaker,
+        multi_codebook = options.multi_codebook,
         "Starting synthesis"
     );
 
@@ -96,7 +99,12 @@ pub async fn run(options: SynthOptions) -> Result<()> {
 
     // Synthesize (with optional speaker for CustomVoice models)
     let synth_start = Instant::now();
-    let audio = pipeline.synthesize_with_speaker(&text, Some(lang), options.speaker.as_deref())?;
+    let audio = if options.multi_codebook {
+        info!("Using multi-codebook decoding (all 16 codebooks)");
+        pipeline.synthesize_with_multi_codebook(&text, Some(lang), options.speaker.as_deref())?
+    } else {
+        pipeline.synthesize_with_speaker(&text, Some(lang), options.speaker.as_deref())?
+    };
     let synth_duration = synth_start.elapsed();
 
     debug!(
@@ -239,6 +247,7 @@ mod tests {
             codec_dir: None,
             model_config: None,
             seed: None,
+            multi_codebook: false,
         }
     }
 

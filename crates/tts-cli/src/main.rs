@@ -69,6 +69,11 @@ enum Commands {
         /// Use streaming mode
         #[arg(long)]
         streaming: bool,
+
+        /// Use multi-codebook decoding (all 16 codebooks via CodePredictor)
+        /// May improve audio quality compared to single-codebook (zeroth) decoding
+        #[arg(long)]
+        multi_codebook: bool,
     },
 
     /// Normalize text without synthesis (dry run)
@@ -134,6 +139,7 @@ async fn main() -> Result<()> {
             model_config,
             seed,
             streaming,
+            multi_codebook,
         } => {
             let synth_options = commands::synth::SynthOptions {
                 input,
@@ -144,6 +150,7 @@ async fn main() -> Result<()> {
                 codec_dir,
                 model_config,
                 seed,
+                multi_codebook,
             };
 
             if streaming {

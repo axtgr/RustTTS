@@ -668,17 +668,228 @@ impl TtsPipeline {
             return Ok(zeroth_tokens);
         }
 
-        // TODO: Enable CodePredictor for multi-codebook generation
-        // Currently the decoder only uses zeroth codebook and fills others with zeros.
-        // To use CodePredictor output, we need to:
-        // 1. Change return type to Vec<Vec<u32>> (16 codebooks)
-        // 2. Update decode_audio to use decode_multi
-        // For now, return only zeroth codebook for simplicity
+        // Return zeroth codebook only for backward compatibility
+        // Use generate_acoustic_multi_codebook for full 16-codebook generation
+        Ok(zeroth_tokens)
+    }
+
+    /// Generate all 16 codebooks using CodePredictor.
+    ///
+    /// Returns `[16][seq_len]` array of tokens for all codebooks.
+    /// If CodePredictor is not available, only zeroth codebook is filled,
+    /// others are set to zero.
+    fn generate_acoustic_multi_codebook(
+        &self,
+        model: &AcousticModel,
+        code_predictor: Option<&CodePredictor>,
+        text_tokens: &[u32],
+        speaker: Option<&str>,
+        lang: Lang,
+        max_tokens: usize,
+    ) -> TtsResult<Vec<Vec<u32>>> {
+        use candle_core::Tensor;
+
+        let st = &self.special_tokens;
+
+        // Get speaker and language IDs
+        let speaker_id = speaker.and_then(|s| st.speaker_ids.by_name(s));
+        let lang_name = match lang {
+            Lang::Ru => "russian",
+            Lang::En => "english",
+            Lang::Mixed => "english",
+        };
+        let lang_id = st.language_ids.by_name(lang_name);
+
+        // Build prompt (same as generate_acoustic_with_speaker)
+        let role_prefix: Vec<u32> = vec![
+            st.im_start_token_id,
+            st.assistant_token_id,
+            st.newline_token_id,
+        ];
+
+        let role_prefix_tensor = Tensor::new(role_prefix.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let role_prefix_embed = model
+            .get_text_embedding(&role_prefix_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        // Build codec prefix
+        let mut codec_prefix: Vec<u32> = vec![st.codec_think_id, st.codec_think_bos_id];
+        if let Some(lid) = lang_id {
+            codec_prefix.push(lid);
+        }
+        codec_prefix.push(st.codec_think_eos_id);
+        if let Some(sid) = speaker_id {
+            codec_prefix.push(sid);
+        }
+        codec_prefix.push(st.codec_pad_id);
+        codec_prefix.push(st.codec_bos_id);
+
+        let text_for_codec_prefix: Vec<u32> = codec_prefix
+            .iter()
+            .take(codec_prefix.len() - 1)
+            .map(|_| st.tts_pad_token_id)
+            .collect();
+
+        let codec_prefix_for_embed: Vec<u32> = codec_prefix[..codec_prefix.len() - 1].to_vec();
+
+        let codec_prefix_tensor = Tensor::new(codec_prefix_for_embed.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let text_for_codec_prefix_tensor =
+            Tensor::new(text_for_codec_prefix.as_slice(), &self.device)
+                .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let codec_prefix_embed = model
+            .get_codec_embedding(&codec_prefix_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let text_for_codec_prefix_embed =
+            model
+                .get_text_embedding(&text_for_codec_prefix_tensor)
+                .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        let codec_prefix_combined = (&text_for_codec_prefix_embed + &codec_prefix_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        // Build text sequence
+        let mut text_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        text_seq.push(st.tts_bos_token_id);
+        text_seq.extend_from_slice(text_tokens);
+        text_seq.push(st.tts_eos_token_id);
+        text_seq.push(st.tts_pad_token_id);
+
+        let mut codec_seq: Vec<u32> = Vec::with_capacity(text_tokens.len() + 3);
+        codec_seq.push(st.codec_bos_id);
+        for _ in 0..text_tokens.len() {
+            codec_seq.push(st.codec_pad_id);
+        }
+        codec_seq.push(st.codec_pad_id);
+        codec_seq.push(st.codec_bos_id);
+
+        let text_seq_tensor = Tensor::new(text_seq.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let codec_seq_tensor = Tensor::new(codec_seq.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
+        let text_seq_embed = model
+            .get_text_embedding(&text_seq_tensor)
+            .map_err(|e| TtsError::inference(format!("text embed failed: {e}")))?;
+
+        let codec_seq_embed = model
+            .get_codec_embedding(&codec_seq_tensor)
+            .map_err(|e| TtsError::inference(format!("codec embed failed: {e}")))?;
+
+        let text_combined = (&text_seq_embed + &codec_seq_embed)
+            .map_err(|e| TtsError::inference(format!("embed add failed: {e}")))?;
+
+        let combined_embeds = Tensor::cat(
+            &[role_prefix_embed, codec_prefix_combined, text_combined],
+            1,
+        )
+        .map_err(|e| TtsError::inference(format!("cat failed: {e}")))?;
+
+        let sampling_config = SamplingConfig {
+            temperature: 0.9,
+            top_p: 1.0,
+            top_k: 50,
+            seed: None,
+        };
+
+        // Generate zeroth codebook
+        let (zeroth_tokens, hidden_states) = model
+            .generate_from_embeds(
+                &combined_embeds,
+                max_tokens,
+                sampling_config.clone(),
+                Some(st.codec_eos_id),
+            )
+            .map_err(|e| TtsError::inference(format!("generation failed: {e}")))?;
+
+        // Filter special tokens from zeroth codebook
+        let zeroth_filtered: Vec<u32> = zeroth_tokens
+            .iter()
+            .filter(|&&t| t < 2048)
+            .copied()
+            .collect();
+
+        if zeroth_filtered.is_empty() {
+            return Err(TtsError::inference(
+                "no valid audio tokens generated".to_string(),
+            ));
+        }
+
+        let seq_len = zeroth_filtered.len();
+
+        // If no CodePredictor, return zeroth + zeros
+        let Some(cp) = code_predictor else {
+            let mut result = Vec::with_capacity(16);
+            result.push(zeroth_filtered);
+            for _ in 1..16 {
+                result.push(vec![0u32; seq_len]);
+            }
+            return Ok(result);
+        };
+
+        // Use CodePredictor to generate all codebooks
+        let zeroth_tensor = Tensor::new(zeroth_tokens.as_slice(), &self.device)
+            .map_err(|e| TtsError::inference(format!("tensor creation failed: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| TtsError::inference(format!("unsqueeze failed: {e}")))?;
+
         info!(
-            "Using zeroth codebook only ({} tokens), CodePredictor available but not used",
+            "Running CodePredictor: hidden={:?}, zeroth={}",
+            hidden_states.dims(),
             zeroth_tokens.len()
         );
-        Ok(zeroth_tokens)
+
+        let all_codes = cp
+            .predict_from_hidden(&hidden_states, &zeroth_tensor, sampling_config)
+            .map_err(|e| TtsError::inference(format!("code prediction failed: {e}")))?;
+
+        // Convert from [1, seq_len, 16] to [16][seq_len]
+        // all_codes is [batch, seq_len, num_codebooks]
+        let all_codes_2d: Vec<Vec<u32>> = all_codes
+            .squeeze(0)
+            .map_err(|e| TtsError::inference(format!("squeeze failed: {e}")))?
+            .to_vec2()
+            .map_err(|e| TtsError::inference(format!("to_vec2 failed: {e}")))?;
+
+        // Transpose: from [seq_len][16] to [16][seq_len]
+        let num_codebooks = 16;
+        let mut result: Vec<Vec<u32>> = (0..num_codebooks)
+            .map(|_| Vec::with_capacity(seq_len))
+            .collect();
+
+        for frame in all_codes_2d.iter() {
+            for (cb_idx, &token) in frame.iter().enumerate() {
+                if cb_idx < num_codebooks {
+                    // Filter special tokens (>= 2048) for each codebook
+                    let filtered_token = if token < 2048 { token } else { 0 };
+                    result[cb_idx].push(filtered_token);
+                }
+            }
+        }
+
+        info!(
+            "Multi-codebook generation complete: {} codebooks x {} tokens",
+            result.len(),
+            result[0].len()
+        );
+
+        Ok(result)
     }
 
     /// Generate acoustic tokens from text tokens with optional speaker.
@@ -827,6 +1038,73 @@ impl TtsPipeline {
             samples = audio.num_samples(),
             duration_ms = audio.duration_ms(),
             "Audio decoded"
+        );
+
+        Ok(audio)
+    }
+
+    /// Full synthesis with multi-codebook decoding (higher quality).
+    ///
+    /// Uses CodePredictor to generate all 16 codebooks for better audio quality.
+    /// Falls back to zeroth codebook only if CodePredictor is not available.
+    #[instrument(skip(self), fields(text_len = text.len(), speaker))]
+    pub fn synthesize_with_multi_codebook(
+        &self,
+        text: &str,
+        lang: Option<Lang>,
+        speaker: Option<&str>,
+    ) -> TtsResult<AudioChunk> {
+        let lang = lang.unwrap_or(self.config.default_lang);
+
+        // 1. Normalize
+        let normalized = self.normalize(text, Some(lang))?;
+        debug!(normalized = %normalized.text, "Text normalized");
+
+        // 2. Tokenize
+        let text_tokens = self.tokenize(&normalized)?;
+        debug!(num_tokens = text_tokens.len(), "Text tokenized");
+
+        // 3. Generate multi-codebook acoustic tokens
+        let multi_tokens = match &self.acoustic {
+            AcousticBackend::Neural {
+                model,
+                code_predictor,
+            } => {
+                let actual_speaker = speaker.or(self.config.default_speaker.as_deref());
+                self.generate_acoustic_multi_codebook(
+                    model,
+                    code_predictor.as_deref(),
+                    &text_tokens,
+                    actual_speaker,
+                    lang,
+                    self.config.max_seq_len,
+                )?
+            }
+            AcousticBackend::Mock => {
+                // Mock: generate single codebook and pad
+                let tokens = self.generate_acoustic_mock(&text_tokens, self.config.max_seq_len)?;
+                let seq_len = tokens.len();
+                let mut result = Vec::with_capacity(16);
+                result.push(tokens);
+                for _ in 1..16 {
+                    result.push(vec![0u32; seq_len]);
+                }
+                result
+            }
+        };
+
+        debug!(
+            codebooks = multi_tokens.len(),
+            seq_len = multi_tokens.first().map(|v| v.len()).unwrap_or(0),
+            "Multi-codebook tokens generated"
+        );
+
+        // 4. Decode using multi-codebook decoder
+        let audio = self.codec.decode_multi(&multi_tokens)?;
+        debug!(
+            samples = audio.num_samples(),
+            duration_ms = audio.duration_ms(),
+            "Audio decoded (multi-codebook)"
         );
 
         Ok(audio)
