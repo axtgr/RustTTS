@@ -570,7 +570,9 @@ impl Model {
             return Ok((generated, empty_hidden));
         }
         generated.push(current_token);
-        all_hidden_states.push(hidden_states.i((.., seq_len - 1.., ..))?.clone());
+        // Store hidden state from prefill for the first token
+        // This is the hidden state at the last position of prefill, which produced current_token
+        all_hidden_states.push(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
 
         // Generate remaining tokens
         for step in 1..max_new_tokens {
@@ -581,9 +583,6 @@ impl Model {
             // Forward pass with codec embedding
             let (logits, hidden_states, new_kv_caches) =
                 self.forward_embeds(&codec_embed, position_offset, kv_caches.as_deref())?;
-
-            // Store hidden state for this step
-            all_hidden_states.push(hidden_states.clone());
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -609,6 +608,10 @@ impl Model {
                 info!("EOS token generated at step {}", step);
                 break;
             }
+
+            // Store hidden state for current_token (the token we just processed)
+            // Only store if we're continuing generation (not EOS)
+            all_hidden_states.push(hidden_states.clone());
 
             generated.push(next_token);
 

@@ -660,16 +660,22 @@ impl TtsPipeline {
         );
 
         // If no CodePredictor, return only zeroth codebook
-        // TODO: Fix CodePredictor shape mismatch and re-enable multi-codebook prediction
-        // For now, return zeroth codebook only - sufficient for basic audio generation
-        if code_predictor.is_none() {
+        let Some(_cp) = code_predictor else {
+            return Ok(zeroth_tokens);
+        };
+
+        if zeroth_tokens.is_empty() {
             return Ok(zeroth_tokens);
         }
 
-        // Temporarily skip CodePredictor due to shape mismatch issue
-        // The zeroth codebook is sufficient for basic audio generation
+        // TODO: Enable CodePredictor for multi-codebook generation
+        // Currently the decoder only uses zeroth codebook and fills others with zeros.
+        // To use CodePredictor output, we need to:
+        // 1. Change return type to Vec<Vec<u32>> (16 codebooks)
+        // 2. Update decode_audio to use decode_multi
+        // For now, return only zeroth codebook for simplicity
         info!(
-            "Skipping CodePredictor (shape mismatch), using zeroth codebook only ({} tokens)",
+            "Using zeroth codebook only ({} tokens), CodePredictor available but not used",
             zeroth_tokens.len()
         );
         Ok(zeroth_tokens)
