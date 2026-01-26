@@ -41,6 +41,8 @@ pub struct PipelineConfig {
     pub max_seq_len: usize,
     /// Default speaker for CustomVoice models (e.g., "vivian", "ryan").
     pub default_speaker: Option<String>,
+    /// Whether the model is a CustomVoice model (requires speaker prompt format).
+    pub is_custom_voice: bool,
 }
 
 impl Default for PipelineConfig {
@@ -52,6 +54,7 @@ impl Default for PipelineConfig {
             chunk_tokens: 10,
             max_seq_len: 4096, // Max sequence length for audio generation
             default_speaker: None,
+            is_custom_voice: false,
         }
     }
 }
@@ -220,9 +223,16 @@ impl TtsPipeline {
             AcousticBackend::Mock
         };
 
-        let config = PipelineConfig::neural();
+        // Check if this is a CustomVoice model by looking for spk_id in config.json
+        let is_custom_voice = Self::detect_custom_voice_model(talker_dir);
 
-        info!("Pipeline created with {:?} acoustic backend", acoustic);
+        let mut config = PipelineConfig::neural();
+        config.is_custom_voice = is_custom_voice;
+
+        info!(
+            "Pipeline created with {:?} acoustic backend, is_custom_voice={}",
+            acoustic, is_custom_voice
+        );
 
         Ok(Self {
             normalizer: Normalizer::new(),
@@ -233,6 +243,27 @@ impl TtsPipeline {
             special_tokens: Qwen3TTSTokens::default(),
             device: device.clone(),
         })
+    }
+
+    /// Detect if this is a CustomVoice model by checking config.json for spk_id.
+    fn detect_custom_voice_model(model_dir: &Path) -> bool {
+        let config_path = model_dir.join("config.json");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                // CustomVoice models have talker_config.spk_id object with speaker mappings
+                if let Some(spk_id) = config
+                    .get("talker_config")
+                    .and_then(|t| t.get("spk_id"))
+                    .and_then(|s| s.as_object())
+                {
+                    if !spk_id.is_empty() {
+                        info!("Detected CustomVoice model with {} speakers", spk_id.len());
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Try to load CodePredictor from the same weights file as the main model.
@@ -454,8 +485,9 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Minimum tokens based on text length
-        let min_tokens = (text_tokens.len() * 5).max(20);
+        // Match Python SDK: min_new_tokens = 2
+        // This allows EOS early if model decides the text is complete
+        let min_tokens = 2;
 
         // Generate using embeddings
         if let Some(cp) = code_predictor {
@@ -701,24 +733,20 @@ impl TtsPipeline {
             "Combined embeddings built (non_streaming format)"
         );
 
-        // Configure sampling - use greedy for debugging to compare with reference
+        // Configure sampling - match Python SDK parameters
         // Python SDK: temperature=0.9, top_p=1.0, top_k=50, repetition_penalty=1.05
-        // TODO: Make this configurable, use temp=0 for greedy comparison
         let sampling_config = SamplingConfig {
-            temperature: 0.0, // Greedy for debugging
+            temperature: 0.9,
             top_p: 1.0,
             top_k: 50,
-            repetition_penalty: 1.0, // No penalty for greedy
+            repetition_penalty: 1.05,
             seed: None,
         };
 
-        // min_new_tokens based on text length: ~5-10 audio tokens per text token
-        let min_tokens = (text_tokens.len() * 5).max(20);
-        info!(
-            "Setting min_new_tokens={} based on {} text tokens",
-            min_tokens,
-            text_tokens.len()
-        );
+        // Match Python SDK: min_new_tokens = 2
+        // This allows EOS early if model decides the text is complete
+        let min_tokens = 2;
+        info!("min_new_tokens={} (matching Python SDK)", min_tokens);
 
         // ========== COMPUTE trailing_text_hidden ==========
         // Python SDK (modeling_qwen3_tts.py:2230-2232):
@@ -985,8 +1013,9 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // min_new_tokens based on text length
-        let min_tokens = (text_tokens.len() * 5).max(20);
+        // Match Python SDK: min_new_tokens = 2
+        // This allows EOS early if model decides the text is complete
+        let min_tokens = 2;
 
         // If no CodePredictor, generate only zeroth codebook
         let Some(cp) = code_predictor else {
@@ -1108,11 +1137,21 @@ impl TtsPipeline {
                 model,
                 code_predictor,
             } => {
-                // Use CustomVoice format if speaker is provided or if we have speaker configured
-                let use_speaker = speaker.is_some() || self.config.default_speaker.is_some();
+                // Use CustomVoice format if:
+                // 1. Speaker is explicitly provided, OR
+                // 2. We have a default speaker configured, OR
+                // 3. The model is a CustomVoice model (even without speaker, needs proper prompt format)
+                let use_speaker_format = speaker.is_some()
+                    || self.config.default_speaker.is_some()
+                    || self.config.is_custom_voice;
+
                 let actual_speaker = speaker.or(self.config.default_speaker.as_deref());
 
-                if use_speaker {
+                if use_speaker_format {
+                    info!(
+                        "Using CustomVoice format: speaker={:?}, is_custom_voice={}",
+                        actual_speaker, self.config.is_custom_voice
+                    );
                     self.generate_acoustic_with_speaker(
                         model,
                         code_predictor.as_deref(),
@@ -1122,6 +1161,7 @@ impl TtsPipeline {
                         max_tokens,
                     )
                 } else {
+                    info!("Using simple format (non-CustomVoice model)");
                     self.generate_acoustic_neural(
                         model,
                         code_predictor.as_deref(),

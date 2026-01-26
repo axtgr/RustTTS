@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TTS App",
+  "version": "0.1.0",
+  "identifier": "com.rusttts.app",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Qwen3-TTS",
+        "width": 600,
+        "height": 700,
+        "resizable": true,
+        "center": true,
+        "minWidth": 400,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": ["../../models/*"]
+  }
+}

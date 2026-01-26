@@ -9,6 +9,7 @@ members = [
     "crates/runtime",
     "crates/tts-cli",
     "crates/tts-server",
+    "crates/tts-app",
 ]
 
 [workspace.package]

@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-TTS</title>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --text-primary: #eaeaea;
+            --text-secondary: #b8b8b8;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --success: #4ade80;
+            --border: #2a2a4a;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 560px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 24px;
+            font-size: 1.8rem;
+            background: linear-gradient(135deg, var(--accent), #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            border: 1px solid var(--border);
+        }
+
+        .card-title {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            margin-bottom: 12px;
+            transition: border-color 0.2s;
+        }
+
+        select:focus, input:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        textarea {
+            width: 100%;
+            height: 150px;
+            padding: 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            resize: vertical;
+            font-family: inherit;
+            line-height: 1.5;
+        }
+
+        .row {
+            display: flex;
+            gap: 12px;
+        }
+
+        .row > * {
+            flex: 1;
+        }
+
+        .slider-container {
+            margin-bottom: 12px;
+        }
+
+        .slider-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+        }
+
+        .slider-value {
+            color: var(--accent);
+            font-weight: 500;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            height: 6px;
+            -webkit-appearance: none;
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+        }
+
+        .buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        button {
+            flex: 1;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--accent-hover);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--border);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status {
+            text-align: center;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 16px;
+            font-size: 0.9rem;
+        }
+
+        .status.loading {
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+
+        .status.success {
+            background: rgba(74, 222, 128, 0.1);
+            color: var(--success);
+        }
+
+        .status.error {
+            background: rgba(233, 69, 96, 0.1);
+            color: var(--accent);
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .init-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--bg-primary);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        .init-overlay h2 {
+            margin-bottom: 20px;
+            color: var(--text-primary);
+        }
+
+        .init-overlay select {
+            width: 300px;
+            margin-bottom: 20px;
+        }
+
+        .init-overlay button {
+            width: 300px;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid transparent;
+            border-top-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .char-count {
+            text-align: right;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Init Overlay -->
+    <div id="initOverlay" class="init-overlay">
+        <h2>Qwen3-TTS</h2>
+        <label for="modelSelect">Select Model</label>
+        <select id="modelSelect">
+            <option value="">Loading models...</option>
+        </select>
+        <div style="margin: 10px 0; color: var(--text-secondary); font-size: 0.85rem;">— or —</div>
+        <label for="customPath">Custom Model Path</label>
+        <input type="text" id="customPath" placeholder="/path/to/model/directory" style="width: 300px; margin-bottom: 20px;">
+        <button id="initBtn" class="btn-primary" disabled>
+            <span id="initBtnText">Initialize</span>
+            <div id="initSpinner" class="spinner hidden"></div>
+        </button>
+        <div id="initStatus" class="status hidden"></div>
+    </div>
+
+    <!-- Main UI -->
+    <div class="container">
+        <h1>Qwen3-TTS</h1>
+
+        <!-- Text Input -->
+        <div class="card">
+            <div class="card-title">Text to Speak</div>
+            <textarea id="textInput" placeholder="Enter text to synthesize..."></textarea>
+            <div class="char-count"><span id="charCount">0</span> characters</div>
+        </div>
+
+        <!-- Voice Settings -->
+        <div class="card">
+            <div class="card-title">Voice Settings</div>
+            <div class="row">
+                <div>
+                    <label for="speakerSelect">Speaker</label>
+                    <select id="speakerSelect">
+                        <option value="">Default</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="languageSelect">Language</label>
+                    <select id="languageSelect">
+                        <option value="ru">Russian</option>
+                        <option value="en">English</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Advanced Settings -->
+        <div class="card">
+            <div class="card-title">Advanced</div>
+            <div class="slider-container">
+                <div class="slider-header">
+                    <label>Temperature</label>
+                    <span class="slider-value" id="tempValue">0.9</span>
+                </div>
+                <input type="range" id="temperature" min="0.1" max="2.0" step="0.1" value="0.9">
+            </div>
+            <div class="slider-container">
+                <div class="slider-header">
+                    <label>Top-P</label>
+                    <span class="slider-value" id="topPValue">1.0</span>
+                </div>
+                <input type="range" id="topP" min="0.1" max="1.0" step="0.05" value="1.0">
+            </div>
+        </div>
+
+        <!-- Buttons -->
+        <div class="buttons">
+            <button id="speakBtn" class="btn-primary" disabled>
+                <span id="speakBtnText">Speak</span>
+                <div id="speakSpinner" class="spinner hidden"></div>
+            </button>
+            <button id="stopBtn" class="btn-secondary" disabled>Stop</button>
+        </div>
+
+        <!-- Status -->
+        <div id="status" class="status hidden"></div>
+    </div>
+
+    <script>
+        // Wait for Tauri to be ready
+        let invoke;
+        
+        function initTauri() {
+            if (window.__TAURI__ && window.__TAURI__.core) {
+                invoke = window.__TAURI__.core.invoke;
+                console.log('Tauri initialized');
+                loadModels();
+            } else {
+                console.log('Waiting for Tauri...');
+                setTimeout(initTauri, 100);
+            }
+        }
+
+        // Elements
+        const initOverlay = document.getElementById('initOverlay');
+        const modelSelect = document.getElementById('modelSelect');
+        const customPath = document.getElementById('customPath');
+        const initBtn = document.getElementById('initBtn');
+        const initBtnText = document.getElementById('initBtnText');
+        const initSpinner = document.getElementById('initSpinner');
+        const initStatus = document.getElementById('initStatus');
+
+        const textInput = document.getElementById('textInput');
+        const charCount = document.getElementById('charCount');
+        const speakerSelect = document.getElementById('speakerSelect');
+        const languageSelect = document.getElementById('languageSelect');
+        const temperature = document.getElementById('temperature');
+        const tempValue = document.getElementById('tempValue');
+        const topP = document.getElementById('topP');
+        const topPValue = document.getElementById('topPValue');
+        const speakBtn = document.getElementById('speakBtn');
+        const speakBtnText = document.getElementById('speakBtnText');
+        const speakSpinner = document.getElementById('speakSpinner');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+
+        // State
+        let isInitialized = false;
+        let isSpeaking = false;
+
+        // Load available models
+        async function loadModels() {
+            try {
+                console.log('Loading models...');
+                const models = await invoke('get_available_models');
+                console.log('Got models:', models);
+                modelSelect.innerHTML = '';
+                
+                if (models.length === 0) {
+                    modelSelect.innerHTML = '<option value="">No models found</option>';
+                    showInitStatus('No models found. Enter a custom model path below.', 'loading');
+                } else {
+                    models.forEach(model => {
+                        const opt = document.createElement('option');
+                        opt.value = model.path;
+                        opt.textContent = model.name + (model.has_speakers ? ' (with voices)' : '');
+                        modelSelect.appendChild(opt);
+                    });
+                }
+                
+                // Enable init button (can use custom path even if no models found)
+                initBtn.disabled = false;
+            } catch (e) {
+                console.error('Failed to load models:', e);
+                modelSelect.innerHTML = '<option value="">Error loading models</option>';
+                showInitStatus('Failed to load models: ' + e, 'error');
+                initBtn.disabled = false; // Still allow custom path
+            }
+        }
+
+        // Initialize TTS
+        async function initTTS() {
+            const modelPath = customPath.value.trim() || modelSelect.value;
+            console.log('initTTS called with modelPath:', modelPath);
+            if (!modelPath) {
+                showInitStatus('Please select a model or enter a custom path', 'error');
+                return;
+            }
+
+            initBtn.disabled = true;
+            initBtnText.textContent = 'Loading...';
+            initSpinner.classList.remove('hidden');
+            showInitStatus('Loading model... This may take a minute.', 'loading');
+
+            try {
+                console.log('Calling init_tts...');
+                const result = await invoke('init_tts', { params: { model_dir: modelPath } });
+                console.log('init_tts result:', result);
+                
+                // Load speakers and languages
+                console.log('Loading speakers...');
+                await loadSpeakers();
+                console.log('Loading languages...');
+                await loadLanguages();
+
+                console.log('Setting isInitialized = true');
+                isInitialized = true;
+                
+                // Show success message briefly
+                showInitStatus('Model loaded! Starting...', 'success');
+                
+                // Small delay to let user see success, then hide overlay
+                setTimeout(() => {
+                    console.log('Hiding initOverlay, element:', initOverlay);
+                    initOverlay.style.display = 'none'; // Direct style as backup
+                    initOverlay.classList.add('hidden');
+                    console.log('initOverlay classes after:', initOverlay.className);
+                    
+                    speakBtn.disabled = false;
+                    console.log('Init complete!');
+                }, 500);
+
+            } catch (e) {
+                console.error('initTTS error:', e);
+                showInitStatus('Failed to initialize: ' + e, 'error');
+                initBtn.disabled = false;
+            } finally {
+                initBtnText.textContent = 'Initialize';
+                initSpinner.classList.add('hidden');
+            }
+        }
+
+        // Load speakers
+        async function loadSpeakers() {
+            try {
+                const speakers = await invoke('get_available_speakers');
+                speakerSelect.innerHTML = '<option value="">Default</option>';
+                speakers.forEach(speaker => {
+                    const opt = document.createElement('option');
+                    opt.value = speaker;
+                    opt.textContent = speaker.charAt(0).toUpperCase() + speaker.slice(1);
+                    speakerSelect.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load speakers:', e);
+            }
+        }
+
+        // Load languages
+        async function loadLanguages() {
+            try {
+                const languages = await invoke('get_available_languages');
+                languageSelect.innerHTML = '';
+                languages.forEach(lang => {
+                    const opt = document.createElement('option');
+                    opt.value = lang.code;
+                    opt.textContent = lang.name;
+                    languageSelect.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load languages:', e);
+            }
+        }
+
+        // Speak
+        async function speak() {
+            const text = textInput.value.trim();
+            if (!text) {
+                showStatus('Please enter some text', 'error');
+                return;
+            }
+
+            isSpeaking = true;
+            speakBtn.disabled = true;
+            speakBtnText.textContent = 'Generating...';
+            speakSpinner.classList.remove('hidden');
+            stopBtn.disabled = false;
+            showStatus('Synthesizing audio...', 'loading');
+
+            try {
+                const result = await invoke('speak', {
+                    params: {
+                        text: text,
+                        speaker: speakerSelect.value || null,
+                        language: languageSelect.value || null,
+                        temperature: parseFloat(temperature.value),
+                        top_p: parseFloat(topP.value)
+                    }
+                });
+
+                if (result.success) {
+                    const durationSec = (result.num_samples / result.sample_rate).toFixed(1);
+                    showStatus(`Playing ${durationSec}s audio (generated in ${result.duration_ms}ms)`, 'success');
+                } else {
+                    showStatus('Synthesis failed: ' + (result.error || 'Unknown error'), 'error');
+                }
+
+            } catch (e) {
+                showStatus('Error: ' + e, 'error');
+            } finally {
+                isSpeaking = false;
+                speakBtn.disabled = false;
+                speakBtnText.textContent = 'Speak';
+                speakSpinner.classList.add('hidden');
+                stopBtn.disabled = true;
+            }
+        }
+
+        // Stop audio
+        async function stopAudio() {
+            try {
+                await invoke('stop_audio');
+                showStatus('Playback stopped', 'success');
+            } catch (e) {
+                console.error('Failed to stop:', e);
+            }
+            stopBtn.disabled = true;
+        }
+
+        // Show status
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = 'status ' + type;
+            status.classList.remove('hidden');
+        }
+
+        function showInitStatus(message, type) {
+            initStatus.textContent = message;
+            initStatus.className = 'status ' + type;
+            initStatus.classList.remove('hidden');
+        }
+
+        // Event listeners
+        textInput.addEventListener('input', () => {
+            charCount.textContent = textInput.value.length;
+        });
+
+        temperature.addEventListener('input', () => {
+            tempValue.textContent = temperature.value;
+        });
+
+        topP.addEventListener('input', () => {
+            topPValue.textContent = topP.value;
+        });
+
+        initBtn.addEventListener('click', initTTS);
+        speakBtn.addEventListener('click', speak);
+        stopBtn.addEventListener('click', stopAudio);
+        
+        // Enable init button when custom path is entered
+        customPath.addEventListener('input', () => {
+            initBtn.disabled = false;
+        });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && e.ctrlKey && isInitialized && !isSpeaking) {
+                speak();
+            }
+            if (e.key === 'Escape' && isSpeaking) {
+                stopAudio();
+            }
+        });
+
+        // Initialize - wait for Tauri
+        document.addEventListener('DOMContentLoaded', () => {
+            initTauri();
+        });
+    </script>
+</body>
+</html>
