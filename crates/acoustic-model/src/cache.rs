@@ -1,188 +1,80 @@
 //! KV cache implementation for efficient autoregressive generation.
 
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use uuid::Uuid;
+use candle_core::{DType, Device, Result, Tensor};
 
-/// A handle to a cached KV state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheHandle {
-    session_id: Uuid,
-    layer: usize,
+/// A chunked KV cache for a single layer.
+/// This avoids O(L^2) memory copying by keeping previous tokens in frozen chunks.
+#[derive(Debug, Clone)]
+pub struct LayerKvCache {
+    /// Frozen chunks of (K, V) pairs.
+    pub frozen: Vec<(Tensor, Tensor)>,
+    /// Current active chunk being built.
+    pub active_k: Tensor,
+    pub active_v: Tensor,
+    /// Maximum size of a chunk.
+    pub chunk_size: usize,
+    /// Current length of the active chunk.
+    pub active_len: usize,
 }
 
-impl CacheHandle {
-    /// Create a new cache handle.
-    pub fn new(session_id: Uuid, layer: usize) -> Self {
-        Self { session_id, layer }
-    }
-}
-
-/// Entry in the KV cache.
-#[derive(Debug)]
-pub struct CacheEntry {
-    /// Key tensor data (flattened).
-    pub keys: Vec<f32>,
-    /// Value tensor data (flattened).
-    pub values: Vec<f32>,
-    /// Current sequence length.
-    pub seq_len: usize,
-    /// Maximum sequence length.
-    pub max_len: usize,
-    /// Last access timestamp (for LRU eviction).
-    pub last_access: std::time::Instant,
-}
-
-impl CacheEntry {
-    /// Create a new cache entry with given capacity.
-    pub fn new(max_len: usize, hidden_size: usize, num_kv_heads: usize) -> Self {
-        let capacity = max_len * num_kv_heads * (hidden_size / num_kv_heads);
-        Self {
-            keys: Vec::with_capacity(capacity),
-            values: Vec::with_capacity(capacity),
-            seq_len: 0,
-            max_len,
-            last_access: std::time::Instant::now(),
-        }
-    }
-
-    /// Check if the cache is full.
-    pub fn is_full(&self) -> bool {
-        self.seq_len >= self.max_len
-    }
-
-    /// Update the last access time.
-    pub fn touch(&mut self) {
-        self.last_access = std::time::Instant::now();
-    }
-}
-
-/// KV cache manager with LRU eviction.
-#[derive(Debug)]
-pub struct KvCacheManager {
-    entries: RwLock<HashMap<CacheHandle, CacheEntry>>,
-    max_entries: usize,
-    hidden_size: usize,
-    num_kv_heads: usize,
-    max_seq_len: usize,
-}
-
-impl KvCacheManager {
-    /// Create a new KV cache manager.
+impl LayerKvCache {
     pub fn new(
-        max_entries: usize,
-        hidden_size: usize,
+        chunk_size: usize,
+        head_dim: usize,
         num_kv_heads: usize,
-        max_seq_len: usize,
-    ) -> Self {
-        Self {
-            entries: RwLock::new(HashMap::with_capacity(max_entries)),
-            max_entries,
-            hidden_size,
-            num_kv_heads,
-            max_seq_len,
-        }
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Initialize empty active chunks
+        let active_k = Tensor::zeros((1, num_kv_heads, 0, head_dim), dtype, device)?;
+        let active_v = Tensor::zeros((1, num_kv_heads, 0, head_dim), dtype, device)?;
+
+        Ok(Self {
+            frozen: Vec::new(),
+            active_k,
+            active_v,
+            chunk_size,
+            active_len: 0,
+        })
     }
 
-    /// Get or create a cache entry for the given handle.
-    pub fn get_or_create(&self, handle: CacheHandle) -> CacheHandle {
-        let mut entries = self.entries.write();
+    /// Append new K, V tokens to the cache.
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        // k, v shape: [batch, num_kv_heads, seq_len, head_dim]
+        // Usually seq_len is 1 during generation.
 
-        if !entries.contains_key(&handle) {
-            // Evict if necessary
-            if entries.len() >= self.max_entries {
-                self.evict_lru(&mut entries);
-            }
+        // Naive implementation for active chunk: cat
+        // Since active chunk is small (< chunk_size), cat is cheap.
+        self.active_k = Tensor::cat(&[&self.active_k, k], 2)?;
+        self.active_v = Tensor::cat(&[&self.active_v, v], 2)?;
+        self.active_len += k.dim(2)?;
 
-            entries.insert(
-                handle,
-                CacheEntry::new(self.max_seq_len, self.hidden_size, self.num_kv_heads),
-            );
-        }
+        // If active chunk is full, freeze it
+        if self.active_len >= self.chunk_size {
+            // If we overshoot, we should split. But for 1-token generation it's exact.
+            // If we receive multiple tokens (prefill), we might need to split.
+            // For simplicity, let's assume we just freeze the whole thing if it exceeds.
+            // Or better: keep it growing until next append?
+            // Let's strictly freeze when >= chunk_size.
 
-        handle
-    }
+            self.frozen
+                .push((self.active_k.clone(), self.active_v.clone()));
 
-    /// Remove a session's cache entries.
-    pub fn remove_session(&self, session_id: Uuid) {
-        let mut entries = self.entries.write();
-        entries.retain(|k, _| k.session_id != session_id);
-    }
-
-    /// Get the number of cached entries.
-    pub fn len(&self) -> usize {
-        self.entries.read().len()
-    }
-
-    /// Check if the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
-    }
-
-    /// Clear all cache entries.
-    pub fn clear(&self) {
-        self.entries.write().clear();
-    }
-
-    /// Evict the least recently used entry.
-    fn evict_lru(&self, entries: &mut HashMap<CacheHandle, CacheEntry>) {
-        if let Some((&handle, _)) = entries.iter().min_by_key(|(_, entry)| entry.last_access) {
-            entries.remove(&handle);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cache_handle() {
-        let session_id = Uuid::new_v4();
-        let handle1 = CacheHandle::new(session_id, 0);
-        let handle2 = CacheHandle::new(session_id, 0);
-        let handle3 = CacheHandle::new(session_id, 1);
-
-        assert_eq!(handle1, handle2);
-        assert_ne!(handle1, handle3);
-    }
-
-    #[test]
-    fn test_cache_manager_basic() {
-        let manager = KvCacheManager::new(10, 256, 4, 1024);
-
-        assert!(manager.is_empty());
-
-        let session_id = Uuid::new_v4();
-        let handle = CacheHandle::new(session_id, 0);
-        manager.get_or_create(handle);
-
-        assert_eq!(manager.len(), 1);
-        assert!(!manager.is_empty());
-    }
-
-    #[test]
-    fn test_cache_manager_session_removal() {
-        let manager = KvCacheManager::new(10, 256, 4, 1024);
-
-        let session_id = Uuid::new_v4();
-        for layer in 0..5 {
-            let handle = CacheHandle::new(session_id, layer);
-            manager.get_or_create(handle);
+            // Reset active
+            let (b, h, _, d) = self.active_k.dims4()?;
+            let device = self.active_k.device().clone();
+            let dtype = self.active_k.dtype();
+            self.active_k = Tensor::zeros((b, h, 0, d), dtype, &device)?;
+            self.active_v = Tensor::zeros((b, h, 0, d), dtype, &device)?;
+            self.active_len = 0;
         }
 
-        assert_eq!(manager.len(), 5);
-
-        manager.remove_session(session_id);
-        assert!(manager.is_empty());
+        Ok(())
     }
 
-    #[test]
-    fn test_cache_entry_is_full() {
-        let mut entry = CacheEntry::new(100, 256, 4);
-        assert!(!entry.is_full());
-
-        entry.seq_len = 100;
-        assert!(entry.is_full());
+    /// Get total sequence length stored in cache
+    pub fn seq_len(&self) -> usize {
+        let frozen_len: usize = self.frozen.iter().map(|(k, _)| k.dim(2).unwrap_or(0)).sum();
+        frozen_len + self.active_len
     }
 }

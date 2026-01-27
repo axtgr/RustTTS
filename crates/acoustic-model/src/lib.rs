@@ -47,7 +47,7 @@ pub mod model;
 pub mod sampling;
 
 // Re-exports for convenience
-pub use cache::{CacheEntry, CacheHandle, KvCacheManager};
+pub use cache::LayerKvCache;
 pub use code_predictor::{CodePredictor, MultiCodebookOutput};
 pub use config::{AcousticModelConfig, CodePredictorConfig};
 pub use layers::{Attention, MLP, RmsNorm, RotaryEmbedding, TextProjection, TransformerBlock};
@@ -75,11 +75,5 @@ mod tests {
         assert_eq!(config.temperature, 1.0);
         assert_eq!(config.top_k, 0);
         assert_eq!(config.top_p, 1.0);
-    }
-
-    #[test]
-    fn test_cache_manager() {
-        let manager = KvCacheManager::new(10, 64, 4, 256);
-        assert!(manager.is_empty());
     }
 }

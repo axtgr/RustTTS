@@ -3,6 +3,7 @@
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
+use crate::cache::LayerKvCache;
 use crate::config::AcousticModelConfig;
 
 /// Trait for rotary position embeddings.
@@ -500,8 +501,8 @@ impl Attention {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        kv_cache: Option<(&Tensor, &Tensor)>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+        mut kv_cache: Option<&mut LayerKvCache>,
+    ) -> Result<Tensor> {
         self.forward_with_debug(x, rope, position_offset, kv_cache, false)
     }
 
@@ -511,9 +512,9 @@ impl Attention {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        kv_cache: Option<(&Tensor, &Tensor)>,
+        mut kv_cache: Option<&mut LayerKvCache>,
         debug: bool,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
 
         // Project Q, K, V
@@ -563,23 +564,40 @@ impl Attention {
             tracing::trace!("K rope head0 last pos, first 10: {:?}", k_rope);
         }
 
-        // Handle KV cache
-        let (k, v) = if let Some((cached_k, cached_v)) = kv_cache {
-            let k = Tensor::cat(&[cached_k, &k], 2)?;
-            let v = Tensor::cat(&[cached_v, &v], 2)?;
-            (k, v)
+        // Chunked Attention Implementation
+        let (attn_weights, total_seq_len) = if let Some(cache) = kv_cache.as_deref_mut() {
+            // Append current k, v to cache
+            cache.append(&k, &v)?;
+
+            // 1. Compute scores against frozen chunks
+            let mut attn_parts = Vec::with_capacity(cache.frozen.len() + 1);
+
+            for (k_chunk, _) in &cache.frozen {
+                let k_expanded = repeat_kv(k_chunk, self.num_heads / self.num_kv_heads)?;
+                let scores = q.matmul(
+                    &k_expanded.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?,
+                )?;
+                attn_parts.push((scores * self.scale as f64)?);
+            }
+
+            // 2. Active chunk
+            let k_active_expanded = repeat_kv(&cache.active_k, self.num_heads / self.num_kv_heads)?;
+            let scores = q.matmul(
+                &k_active_expanded.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?,
+            )?;
+            attn_parts.push((scores * self.scale as f64)?);
+
+            let weights = Tensor::cat(&attn_parts, candle_core::D::Minus1)?;
+            (weights, cache.seq_len())
         } else {
-            (k, v)
+            // Standard attention (no cache)
+            let k_expanded = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
+            let weights = (q
+                .matmul(&k_expanded.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?
+                * self.scale as f64)?;
+            let len = k_expanded.dim(2)?;
+            (weights, len)
         };
-
-        // GQA: repeat KV heads if needed
-        let k_expanded = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
-        let v_expanded = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
-
-        // Scaled dot-product attention
-        let attn_weights = (q
-            .matmul(&k_expanded.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?
-            * self.scale as f64)?;
 
         if debug {
             // Attention weights before mask, head 0, last query position
@@ -591,7 +609,6 @@ impl Attention {
         }
 
         // Causal mask
-        let total_seq_len = k_expanded.dim(2)?;
         let mask = create_causal_mask(seq_len, total_seq_len, x.device())?;
         let attn_weights = attn_weights.broadcast_add(&mask)?;
 
@@ -604,7 +621,7 @@ impl Attention {
             );
         }
 
-        // Softmax and value projection
+        // Softmax
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
         if debug {
@@ -616,7 +633,43 @@ impl Attention {
             );
         }
 
-        let attn_output = attn_weights.matmul(&v_expanded)?;
+        // Weighted sum with V
+        let attn_output = if let Some(cache) = kv_cache.as_deref_mut() {
+            // Chunked V multiplication
+            let mut offset = 0;
+            let mut out_accum: Option<Tensor> = None;
+
+            // Frozen
+            for i in 0..cache.frozen.len() {
+                let chunk_len = cache.frozen[i].0.dim(2)?;
+                let prob_chunk = attn_weights.narrow(candle_core::D::Minus1, offset, chunk_len)?;
+                let v_chunk = &cache.frozen[i].1;
+                let v_expanded = repeat_kv(v_chunk, self.num_heads / self.num_kv_heads)?;
+
+                let part_out = prob_chunk.matmul(&v_expanded)?;
+                match out_accum {
+                    None => out_accum = Some(part_out),
+                    Some(acc) => out_accum = Some((acc + part_out)?),
+                }
+                offset += chunk_len;
+            }
+
+            // Active
+            let chunk_len = cache.active_k.dim(2)?;
+            let prob_chunk = attn_weights.narrow(candle_core::D::Minus1, offset, chunk_len)?;
+            let v_active_expanded = repeat_kv(&cache.active_v, self.num_heads / self.num_kv_heads)?;
+            let part_out = prob_chunk.matmul(&v_active_expanded)?;
+            match out_accum {
+                None => out_accum = Some(part_out),
+                Some(acc) => out_accum = Some((acc + part_out)?),
+            }
+
+            out_accum.unwrap()
+        } else {
+            // Standard V multiplication
+            let v_expanded = repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
+            attn_weights.matmul(&v_expanded)?
+        };
 
         if debug {
             // Attention output before o_proj, head 0, last position
@@ -646,8 +699,8 @@ impl Attention {
             );
         }
 
-        // Return output and updated KV cache (original k, v without expansion)
-        Ok((output, k, v))
+        // Return output (KV cache updated in place)
+        Ok(output)
     }
 }
 
@@ -773,8 +826,8 @@ impl TransformerBlock {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        kv_cache: Option<(&Tensor, &Tensor)>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+        mut kv_cache: Option<&mut LayerKvCache>,
+    ) -> Result<Tensor> {
         self.forward_with_debug(x, rope, position_offset, kv_cache, false)
     }
 
@@ -784,9 +837,9 @@ impl TransformerBlock {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        kv_cache: Option<(&Tensor, &Tensor)>,
+        mut kv_cache: Option<&mut LayerKvCache>,
         debug: bool,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
 
         // Pre-norm + attention + residual
@@ -800,7 +853,7 @@ impl TransformerBlock {
             );
         }
 
-        let (attn_output, k_cache, v_cache) =
+        let attn_output =
             self.self_attn
                 .forward_with_debug(&normed, rope, position_offset, kv_cache, debug)?;
         let x = (x + attn_output)?;
@@ -841,7 +894,7 @@ impl TransformerBlock {
             );
         }
 
-        Ok((x, k_cache, v_cache))
+        Ok(x)
     }
 }
 

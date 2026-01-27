@@ -364,13 +364,26 @@ impl CodePredictor {
         );
 
         // Pass through transformer layers with KV cache
-        let mut kv_caches: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+        let mut kv_caches: Vec<crate::cache::LayerKvCache> = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            kv_caches.push(crate::cache::LayerKvCache::new(
+                64,
+                self.config.head_dim,
+                self.config.num_kv_heads,
+                &self.device,
+                DType::F32,
+            )?);
+        }
+
         let mut current_hidden = prefill_embeds;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let (new_hidden, k_cache, v_cache) =
-                layer.forward(&current_hidden, &self.rotary_emb, 0, None)?;
-            kv_caches[i] = Some((k_cache, v_cache));
+            let new_hidden = layer.forward(
+                &current_hidden,
+                &self.rotary_emb,
+                0,
+                Some(&mut kv_caches[i]),
+            )?;
             current_hidden = new_hidden;
         }
 
@@ -406,10 +419,12 @@ impl CodePredictor {
             let mut current_hidden = input_embed;
 
             for (i, layer) in self.layers.iter().enumerate() {
-                let kv_ref = kv_caches[i].as_ref().map(|(k, v)| (k, v));
-                let (new_hidden, k_cache, v_cache) =
-                    layer.forward(&current_hidden, &self.rotary_emb, position_offset, kv_ref)?;
-                kv_caches[i] = Some((k_cache, v_cache));
+                let new_hidden = layer.forward(
+                    &current_hidden,
+                    &self.rotary_emb,
+                    position_offset,
+                    Some(&mut kv_caches[i]),
+                )?;
                 current_hidden = new_hidden;
             }
 

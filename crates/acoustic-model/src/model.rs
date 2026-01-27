@@ -6,6 +6,7 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder, embedding};
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::cache::LayerKvCache;
 use crate::code_predictor::CodePredictor;
 use crate::config::AcousticModelConfig;
 use crate::layers::{
@@ -15,10 +16,10 @@ use crate::layers::{
 use crate::sampling::{Sampler, SamplingConfig, apply_repetition_penalty};
 
 /// KV cache type alias for transformer layers.
-pub type KvCache = Vec<(Tensor, Tensor)>;
+pub type KvCache = Vec<LayerKvCache>;
 
-/// Forward output with hidden states: (logits, hidden_states, kv_caches).
-pub type ForwardWithHiddenOutput = (Tensor, Tensor, KvCache);
+/// Forward output with hidden states: (logits, hidden_states).
+pub type ForwardWithHiddenOutput = (Tensor, Tensor);
 
 /// Rotary embedding variant: standard or multimodal.
 #[derive(Debug)]
@@ -275,14 +276,14 @@ impl Model {
     /// For text tokens (< text_vocab_size), applies text_embedding + text_projection.
     /// For codec tokens, applies codec_embedding.
     ///
-    /// Returns logits for the next token and updated KV caches.
+    /// Returns logits for the next token. KV caches are updated in-place.
     #[instrument(skip(self, input_ids, kv_caches))]
     pub fn forward(
         &self,
         input_ids: &Tensor,
         position_offset: usize,
-        kv_caches: Option<&[(Tensor, Tensor)]>,
-    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        mut kv_caches: Option<&mut [LayerKvCache]>,
+    ) -> Result<Tensor> {
         // For now, assume all input_ids are text tokens or codec tokens uniformly
         // In practice, need to handle mixed sequences based on token ranges
         // TODO: Handle mixed text/codec sequences properly
@@ -291,16 +292,16 @@ impl Model {
         let mut hidden_states = self.embed_text(input_ids)?;
 
         // Pass through transformer layers
-        let mut new_kv_caches = Vec::with_capacity(self.layers.len());
-
         for (i, layer) in self.layers.iter().enumerate() {
-            let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
+            let kv_cache = match kv_caches {
+                Some(ref mut caches) => Some(&mut caches[i]),
+                None => None,
+            };
 
-            let (new_hidden, k_cache, v_cache) =
+            let new_hidden =
                 layer.forward(&hidden_states, &self.rotary_emb, position_offset, kv_cache)?;
 
             hidden_states = new_hidden;
-            new_kv_caches.push((k_cache, v_cache));
         }
 
         // Final norm
@@ -309,7 +310,7 @@ impl Model {
         // Project to codec vocabulary
         let logits = self.codec_head.forward(&hidden_states)?;
 
-        Ok((logits, new_kv_caches))
+        Ok(logits)
     }
 
     // Note: generate() and generate_with_hidden() methods have been removed.
@@ -365,11 +366,24 @@ impl Model {
         let tts_pad_tensor = Tensor::new(&[tts_pad_token_id], &self.device)?.unsqueeze(0)?;
         let tts_pad_embed = self.embed_text(&tts_pad_tensor)?; // [1, 1, hidden_size]
 
+        // Initialize KV Caches
+        let mut kv_caches = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            kv_caches.push(LayerKvCache::new(
+                64,
+                self.config.hidden_size,
+                self.config.num_kv_heads,
+                &self.device,
+                DType::F32,
+            )?);
+        }
+
         // Step 1: Prefill with combined embeddings
-        let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
+        let (logits, hidden_states) =
+            self.forward_embeds(combined_embeds, 0, Some(&mut kv_caches))?;
 
         let mut position_offset = seq_len;
-        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(kv_caches);
+        // kv_caches are updated in-place
 
         // Sample first codec token from last position's logits
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -417,8 +431,8 @@ impl Model {
             let combined_step_embed = (&tts_pad_embed + &codec_embed)?;
 
             // Forward pass with combined dual-track embedding
-            let (logits, hidden_states, new_kv_caches) =
-                self.forward_embeds(&combined_step_embed, position_offset, kv_caches.as_deref())?;
+            let (logits, hidden_states) =
+                self.forward_embeds(&combined_step_embed, position_offset, Some(&mut kv_caches))?;
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -486,7 +500,6 @@ impl Model {
             generated.push(next_token);
 
             // Update for next iteration
-            kv_caches = Some(new_kv_caches);
             position_offset += 1;
             current_token = next_token;
         }
@@ -586,8 +599,21 @@ impl Model {
             trailing_text_len
         );
 
+        // Initialize KV Caches
+        let mut kv_caches = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            kv_caches.push(LayerKvCache::new(
+                64,
+                self.config.head_dim,
+                self.config.num_kv_heads,
+                &self.device,
+                DType::F32,
+            )?);
+        }
+
         // Step 1: Prefill with combined embeddings
-        let (logits, hidden_states, kv_caches) = self.forward_embeds(combined_embeds, 0, None)?;
+        let (logits, hidden_states) =
+            self.forward_embeds(combined_embeds, 0, Some(&mut kv_caches))?;
 
         // Debug: print hidden_states at last position after prefill
         let hs_last: Vec<f32> = hidden_states.i((0, seq_len - 1, ..20))?.to_vec1()?;
@@ -597,7 +623,6 @@ impl Model {
         );
 
         let mut position_offset = seq_len;
-        let mut kv_caches: Option<Vec<(Tensor, Tensor)>> = Some(kv_caches);
 
         // Sample first zeroth token from last position's logits
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -698,8 +723,8 @@ impl Model {
             let combined_step_embed = ((&zeroth_embed + &residual_sum)? + &text_conditioning)?;
 
             // Forward pass
-            let (logits, hidden_states, new_kv_caches) =
-                self.forward_embeds(&combined_step_embed, position_offset, kv_caches.as_deref())?;
+            let (logits, hidden_states) =
+                self.forward_embeds(&combined_step_embed, position_offset, Some(&mut kv_caches))?;
 
             // Get logits for the last position
             let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -784,7 +809,6 @@ impl Model {
             all_frames.push(frame);
 
             // Update for next iteration
-            kv_caches = Some(new_kv_caches);
             position_offset += 1;
             current_zeroth_token = next_zeroth;
             prev_residual_codes = residual_codes;
@@ -827,16 +851,15 @@ impl Model {
     /// Forward pass from pre-computed embeddings (for CustomVoice flow).
     ///
     /// # Returns
-    /// Tuple of (logits, hidden_states, kv_caches)
+    /// Tuple of (logits, hidden_states)
     #[allow(clippy::type_complexity)]
     fn forward_embeds(
         &self,
         hidden_states: &Tensor,
         position_offset: usize,
-        kv_caches: Option<&[(Tensor, Tensor)]>,
-    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+        mut kv_caches: Option<&mut [LayerKvCache]>,
+    ) -> Result<(Tensor, Tensor)> {
         let mut hidden_states = hidden_states.clone();
-        let mut new_kv_caches = Vec::with_capacity(self.layers.len());
         let seq_len = hidden_states.dim(1)?;
 
         // Debug: log input embeddings (only for prefill)
@@ -849,11 +872,14 @@ impl Model {
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let kv_cache = kv_caches.map(|caches| (&caches[i].0, &caches[i].1));
+            let kv_cache = match kv_caches {
+                Some(ref mut caches) => Some(&mut caches[i]),
+                None => None,
+            };
 
             // Enable debug for layer 0 during prefill
             let debug_layer = i == 0 && position_offset == 0 && seq_len > 1;
-            let (new_hidden, k_cache, v_cache) = layer.forward_with_debug(
+            let new_hidden = layer.forward_with_debug(
                 &hidden_states,
                 &self.rotary_emb,
                 position_offset,
@@ -862,7 +888,6 @@ impl Model {
             )?;
 
             hidden_states = new_hidden;
-            new_kv_caches.push((k_cache, v_cache));
 
             // Debug: log after first few layers (only for prefill, to reduce noise)
             if position_offset == 0 && seq_len > 1 && (i < 5 || i >= self.layers.len() - 3) {
@@ -880,7 +905,7 @@ impl Model {
         // Project to codec vocabulary
         let logits = self.codec_head.forward(&hidden_states)?;
 
-        Ok((logits, hidden_states, new_kv_caches))
+        Ok((logits, hidden_states))
     }
 
     /// Get text embedding for given token IDs.
@@ -898,7 +923,7 @@ impl Model {
 pub struct StreamingGenerator<'a> {
     model: &'a Model,
     sampler: Sampler,
-    kv_caches: Option<Vec<(Tensor, Tensor)>>,
+    kv_caches: Option<Vec<LayerKvCache>>,
     position_offset: usize,
     eos_token_id: Option<u32>,
     max_tokens: usize,
@@ -930,9 +955,20 @@ impl<'a> StreamingGenerator<'a> {
     pub fn prefill(&mut self, input_ids: &[u32]) -> Result<()> {
         let input_tensor = Tensor::new(input_ids, self.model.device())?.unsqueeze(0)?;
 
-        let (_, new_kv_caches) = self.model.forward(&input_tensor, 0, None)?;
+        let mut kv_caches = Vec::with_capacity(self.model.layers.len());
+        for _ in 0..self.model.layers.len() {
+            kv_caches.push(LayerKvCache::new(
+                64,
+                self.model.config.head_dim,
+                self.model.config.num_kv_heads,
+                self.model.device(),
+                DType::F32,
+            )?);
+        }
 
-        self.kv_caches = Some(new_kv_caches);
+        self.model.forward(&input_tensor, 0, Some(&mut kv_caches))?;
+
+        self.kv_caches = Some(kv_caches);
         self.position_offset = input_ids.len();
 
         Ok(())
@@ -946,11 +982,14 @@ impl<'a> StreamingGenerator<'a> {
 
         let input_tensor = Tensor::new(&[current_token], self.model.device())?.unsqueeze(0)?;
 
-        let (logits, new_kv_caches) = self.model.forward(
-            &input_tensor,
-            self.position_offset,
-            self.kv_caches.as_deref(),
-        )?;
+        let logits = if let Some(ref mut caches) = self.kv_caches {
+            self.model
+                .forward(&input_tensor, self.position_offset, Some(caches))?
+        } else {
+            return Err(candle_core::Error::Msg(
+                "StreamingGenerator not prefilled".into(),
+            ));
+        };
 
         // Get logits for the last position
         let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
@@ -966,7 +1005,6 @@ impl<'a> StreamingGenerator<'a> {
         }
 
         // Update state
-        self.kv_caches = Some(new_kv_caches);
         self.position_offset += 1;
         self.generated_count += 1;
 
