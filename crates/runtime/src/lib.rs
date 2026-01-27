@@ -9,7 +9,9 @@
 //! - Batching for efficient GPU utilization
 //! - QoS policies (priority, deadlines, cancellation)
 //! - Structured logging and metrics
+//! - Device selection (CPU, Metal, CUDA)
 
+pub mod device;
 pub mod logging;
 pub mod metrics;
 pub mod pipeline;
@@ -25,6 +27,9 @@ use tracing::{debug, info, instrument, warn};
 
 use tts_core::{AudioChunk, RuntimeConfig, SynthesisRequest, TtsError, TtsResult};
 
+pub use device::{
+    DevicePreference, device_name, is_cuda_available, is_metal_available, select_device,
+};
 pub use pipeline::{PipelineBackend, PipelineConfig, StreamingSession, TtsPipeline};
 pub use queue::{QueuedRequest, RequestQueue};
 

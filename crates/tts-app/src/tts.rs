@@ -4,7 +4,6 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use candle_core::Device;
 use rodio::{Decoder, OutputStream, Sink};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -12,7 +11,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use audio_codec_12hz::{apply_fade_in, apply_fade_out};
-use runtime::TtsPipeline;
+use runtime::{DevicePreference, TtsPipeline, device_name, select_device};
 use tts_core::Lang;
 
 /// Application state managed by Tauri.
@@ -120,8 +119,17 @@ pub async fn init_tts(params: InitParams, state: State<'_, AppState>) -> Result<
     info!("Tokenizer: {}", tokenizer_dir.display());
     info!("Codec: {}", codec_dir.display());
 
-    // Use CPU device (Metal/CUDA support can be added later)
-    let device = Device::Cpu;
+    // Auto-select best available device (Metal GPU on Apple Silicon, CUDA, or CPU)
+    let device = match select_device(DevicePreference::Auto) {
+        Ok(d) => {
+            info!("Selected device: {}", device_name(&d));
+            d
+        }
+        Err(e) => {
+            error!("Device selection failed: {}, falling back to CPU", e);
+            candle_core::Device::Cpu
+        }
+    };
 
     // Load pipeline
     let pipeline =

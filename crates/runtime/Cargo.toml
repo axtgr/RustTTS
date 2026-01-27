@@ -10,6 +10,9 @@ license.workspace = true
 [features]
 default = []
 server = ["tonic", "prost"]
+cuda = ["acoustic-model/cuda", "audio-codec-12hz/cuda", "candle-core/cuda"]
+metal = ["acoustic-model/metal", "audio-codec-12hz/metal", "candle-core/metal"]
+accelerate = ["acoustic-model/accelerate", "audio-codec-12hz/accelerate", "candle-core/accelerate"]
 golden_tests = []
 
 [dependencies]

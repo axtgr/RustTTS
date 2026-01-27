@@ -51,3 +51,6 @@ dirs = "5"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+cuda = ["runtime/cuda", "candle-core/cuda"]
+metal = ["runtime/metal", "candle-core/metal"]
+accelerate = ["runtime/accelerate", "candle-core/accelerate"]
