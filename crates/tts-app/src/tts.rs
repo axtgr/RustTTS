@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use audio_codec_12hz::{apply_fade_in, apply_fade_out};
-use runtime::{DevicePreference, TtsPipeline, device_name, select_device};
+use runtime::{device_name, select_device, DevicePreference, TtsPipeline};
 use tts_core::Lang;
 
 /// Application state managed by Tauri.

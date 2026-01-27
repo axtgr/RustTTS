@@ -1827,19 +1827,25 @@ impl SelfAttention {
         let v = x_flat.matmul(&self.v_proj.t()?)?;
 
         // Reshape to [batch, seq_len, num_heads, head_dim], then transpose to [batch, num_heads, seq_len, head_dim]
+        // Reshape and transpose to [batch, num_heads, seq_len, head_dim]
+        // Use contiguous() for Metal GPU compatibility
         let q = q
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let k = k
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = v
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
         // Scaled dot-product attention with causal mask
         let scale = (self.head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let scores = q.matmul(&k_t)?.affine(1.0 / scale, 0.0)?;
 
         // Causal mask
         let mask = Self::causal_mask(seq_len, x.device())?;
