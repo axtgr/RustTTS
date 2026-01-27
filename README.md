@@ -93,7 +93,25 @@ grpcurl -plaintext -d '{"text": "Привет мир", "language": 1}' \
 | Phase 5 | ✅ | CLI (synth, normalize, tokenize) |
 | Phase 6 | ✅ | gRPC Server (streaming, health, metrics) |
 
-**Текущий статус:** Все основные фазы завершены. Mock-реализация полного pipeline готова.
+**Текущий статус:** Все основные фазы завершены. Полнофункциональный TTS pipeline работает.
+
+## Производительность
+
+Сравнение с Python SDK (Apple Silicon, MPS vs CPU):
+
+| Метрика | Python SDK (MPS) | RustTTS (CPU) |
+|---------|------------------|---------------|
+| Загрузка модели | 2.4s | 2.7s |
+| RTF (short text) | 4.3x | 5.4x |
+| RTF (long text) | 2.5x | 3.6x |
+| Размер | ~2GB (venv) | ~12MB |
+| Cold start | ~5-10s | ~3s |
+
+> RTF (Real-Time Factor) — отношение времени синтеза к длительности аудио. Меньше = лучше.
+
+Python быстрее за счет GPU ускорения (MPS). Rust выигрывает в размере и простоте развертывания.
+
+Подробности: **[Benchmark](docs/benchmark.md)**
 
 ## Тестирование
 
