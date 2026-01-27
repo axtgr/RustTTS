@@ -488,9 +488,11 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Match Python SDK: min_new_tokens = 2
-        // This allows EOS early if model decides the text is complete
-        let min_tokens = 2;
+        // WORKAROUND: Calculate min_tokens based on text length to prevent premature EOS
+        // TODO: Investigate root cause - model generates EOS too early for some texts
+        // ~12 audio tokens/sec at 12Hz, estimate ~0.1s per text token
+        let estimated_duration_s = (text_tokens.len() as f32 * 0.1).max(0.5);
+        let min_tokens = (estimated_duration_s * 12.0) as usize;
 
         // Generate using embeddings
         if let Some(cp) = code_predictor {
@@ -746,10 +748,11 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Match Python SDK: min_new_tokens = 2
-        // This allows EOS early if model decides the text is complete
-        let min_tokens = 2;
-        info!("min_new_tokens={} (matching Python SDK)", min_tokens);
+        // WORKAROUND: Calculate min_tokens based on text length to prevent premature EOS
+        // TODO: Investigate root cause - model generates EOS too early for some texts
+        // ~12 audio tokens/sec at 12Hz, estimate ~0.1s per text token
+        let estimated_duration_s = (text_tokens.len() as f32 * 0.1).max(0.5);
+        let min_tokens = (estimated_duration_s * 12.0) as usize;
 
         // ========== COMPUTE trailing_text_hidden ==========
         // In non_streaming_mode (which we use), ALL text tokens are already in prefill.
@@ -996,9 +999,11 @@ impl TtsPipeline {
             seed: None,
         };
 
-        // Match Python SDK: min_new_tokens = 2
-        // This allows EOS early if model decides the text is complete
-        let min_tokens = 2;
+        // WORKAROUND: Calculate min_tokens based on text length to prevent premature EOS
+        // TODO: Investigate root cause - model generates EOS too early for some texts
+        // ~12 audio tokens/sec at 12Hz, estimate ~0.1s per text token
+        let estimated_duration_s = (text_tokens.len() as f32 * 0.1).max(0.5);
+        let min_tokens = (estimated_duration_s * 12.0) as usize;
 
         // If no CodePredictor, generate only zeroth codebook
         let Some(cp) = code_predictor else {

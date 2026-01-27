@@ -1489,7 +1489,8 @@ impl NeuralDecoder {
                 .sqrt();
             debug_print!(
                 "DEBUG: pre_transformer output mean={:.4}, std={:.4}",
-                mean, std
+                mean,
+                std
             );
         }
         debug!("After pre_transformer: {:?}", x.dims());
