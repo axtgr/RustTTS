@@ -1,7 +1,7 @@
 //! Structured logging setup with tracing.
 
 use tracing_subscriber::{
-    EnvFilter,
+    EnvFilter, Registry,
     fmt::{self, format::FmtSpan},
     prelude::*,
 };
@@ -10,9 +10,9 @@ use tracing_subscriber::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
     /// Human-readable text format.
+    #[default]
     Text,
     /// JSON format for structured logging.
-    #[default]
     Json,
 }
 
@@ -39,45 +39,30 @@ impl std::str::FromStr for LogFormat {
 /// use runtime::logging::{init_logging, LogFormat};
 /// init_logging("info", LogFormat::Json);
 /// ```
-pub fn init_logging(level: &str, format: LogFormat) {
+pub fn init_logging(level: &str, _format: LogFormat) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
-    match format {
-        LogFormat::Text => {
-            let subscriber = tracing_subscriber::registry().with(env_filter).with(
-                fmt::layer()
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_span_events(FmtSpan::CLOSE),
-            );
+    let subscriber = Registry::default().with(env_filter).with(
+        fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_span_events(FmtSpan::CLOSE),
+    );
 
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        }
-        LogFormat::Json => {
-            let subscriber = tracing_subscriber::registry().with(env_filter).with(
-                fmt::layer()
-                    .json()
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_span_events(FmtSpan::CLOSE),
-            );
-
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        }
-    }
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 /// Initialize logging from environment variables.
 ///
 /// Uses:
 /// - `RUST_LOG` for log level (default: "info")
-/// - `LOG_FORMAT` for format (default: "json")
+/// - `LOG_FORMAT` for format (default: "text")
 pub fn init_logging_from_env() {
     let level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let format: LogFormat = std::env::var("LOG_FORMAT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_default();
+        .unwrap_or(LogFormat::Text);
 
     init_logging(&level, format);
 }

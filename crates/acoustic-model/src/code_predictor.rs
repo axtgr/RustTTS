@@ -11,11 +11,15 @@
 //! - Takes hidden states from Talker as input
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder, embedding};
+use candle_nn::{Embedding, Module, VarBuilder};
+use candle_transformers::quantized_var_builder as quantized_vb;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::CodePredictorConfig;
-use crate::layers::{RmsNorm, RotaryEmbedding, TransformerBlock};
+use crate::layers::{
+    LinearLayer, RmsNorm, RotaryEmbedding, TransformerBlock, Weights, embedding_from_weights,
+    linear_no_bias, rms_norm_from_weights,
+};
 use crate::sampling::{Sampler, SamplingConfig};
 
 /// Code Predictor model for multi-codebook prediction.
@@ -38,7 +42,7 @@ pub struct CodePredictor {
     norm: RmsNorm,
     /// Output heads for each residual codebook (predicts codebook i+1).
     /// lm_heads[i] outputs logits for codebook i+1.
-    lm_heads: Vec<candle_nn::Linear>,
+    lm_heads: Vec<LinearLayer>,
     /// Rotary position embeddings.
     rotary_emb: RotaryEmbedding,
     /// Model configuration.
@@ -48,7 +52,7 @@ pub struct CodePredictor {
 }
 
 impl CodePredictor {
-    /// Load CodePredictor from safetensors weights.
+    /// Load CodePredictor from safetensors or gguf weights.
     #[instrument(skip(path, config, device), fields(num_layers = config.num_layers))]
     pub fn load(
         path: impl AsRef<std::path::Path>,
@@ -58,18 +62,31 @@ impl CodePredictor {
         let path = path.as_ref();
         info!("Loading CodePredictor from {}", path.display());
 
+        if path.extension().and_then(|ext| ext.to_str()) == Some("gguf") {
+            let vb = quantized_vb::VarBuilder::from_gguf(path, device)?;
+            return Self::from_weights(Weights::Quantized(vb), config, device);
+        }
+
         let tensors = candle_core::safetensors::load(path, device)?;
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
 
-        Self::from_vb(vb, config, device)
+        Self::from_weights(Weights::Standard(vb), config, device)
     }
 
     /// Create CodePredictor from VarBuilder.
     ///
     /// Qwen3-TTS path: `talker.code_predictor.model.*` and `talker.code_predictor.lm_head.*`
     pub fn from_vb(vb: VarBuilder, config: CodePredictorConfig, device: &Device) -> Result<Self> {
+        Self::from_weights(Weights::Standard(vb), config, device)
+    }
+
+    fn from_weights(
+        weights: Weights<'_>,
+        config: CodePredictorConfig,
+        device: &Device,
+    ) -> Result<Self> {
         // Qwen3-TTS: talker.code_predictor.model.* and talker.code_predictor.lm_head.*
-        let vb_predictor = vb.pp("talker").pp("code_predictor");
+        let vb_predictor = weights.pp("talker").pp("code_predictor");
         let vb_model = vb_predictor.pp("model");
 
         let num_residual_groups = config.num_code_groups - 1; // 15 for Qwen3-TTS
@@ -78,7 +95,7 @@ impl CodePredictor {
         // Qwen3-TTS: talker.code_predictor.model.codec_embedding.{0-14}.weight [2048, 1024]
         let mut codec_embeddings = Vec::with_capacity(num_residual_groups);
         for i in 0..num_residual_groups {
-            let emb = embedding(
+            let emb = embedding_from_weights(
                 config.codebook_size,
                 config.hidden_size,
                 vb_model.pp(format!("codec_embedding.{i}")),
@@ -130,13 +147,14 @@ impl CodePredictor {
         }
 
         // Final norm
-        let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
+        let norm =
+            rms_norm_from_weights(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
 
         // Separate LM head for each residual codebook (groups 1 to num_code_groups-1)
         // Qwen3-TTS: talker.code_predictor.lm_head.{0-14}.weight [2048, 1024]
         let mut lm_heads = Vec::with_capacity(num_residual_groups);
         for i in 0..num_residual_groups {
-            let head = candle_nn::linear_no_bias(
+            let head = linear_no_bias(
                 config.hidden_size,
                 config.codebook_size,
                 vb_predictor.pp(format!("lm_head.{i}")),
@@ -199,7 +217,7 @@ impl CodePredictor {
                 (config.codebook_size, config.hidden_size),
                 device,
             )?;
-            let head = candle_nn::Linear::new(weight, None);
+            let head = LinearLayer::Standard(candle_nn::Linear::new(weight, None));
             lm_heads.push(head);
         }
 

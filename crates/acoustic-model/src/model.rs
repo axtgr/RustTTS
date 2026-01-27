@@ -3,15 +3,17 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder, embedding};
+use candle_nn::{Embedding, Module, VarBuilder};
+use candle_transformers::quantized_var_builder as quantized_vb;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::cache::LayerKvCache;
 use crate::code_predictor::CodePredictor;
 use crate::config::AcousticModelConfig;
 use crate::layers::{
-    MultimodalRotaryEmbedding, RmsNorm, RotaryEmbedding, RotaryEmbeddingTrait, TextProjection,
-    TransformerBlock,
+    LinearLayer, MultimodalRotaryEmbedding, RmsNorm, RotaryEmbedding, RotaryEmbeddingTrait,
+    TextProjection, TransformerBlock, Weights, embedding_from_weights, linear, linear_no_bias,
+    rms_norm_from_weights,
 };
 use crate::sampling::{Sampler, SamplingConfig, apply_repetition_penalty};
 
@@ -60,7 +62,7 @@ pub struct Model {
     /// Final layer normalization.
     norm: RmsNorm,
     /// Output projection to codec vocabulary.
-    codec_head: candle_nn::Linear,
+    codec_head: LinearLayer,
     /// Rotary position embeddings (standard or multimodal).
     rotary_emb: RotaryEmbeddingType,
     /// Model configuration.
@@ -84,18 +86,31 @@ impl Model {
         let config = AcousticModelConfig::from_pretrained(dir).map_err(candle_core::Error::msg)?;
 
         // Load weights
-        let weights_path = dir.join("model.safetensors");
-        if !weights_path.exists() {
-            return Err(candle_core::Error::msg(format!(
-                "model.safetensors not found in {}",
-                dir.display()
-            )));
-        }
-
+        let weights_path = Self::select_weights_path(dir)?;
         Self::load(&weights_path, config, device)
     }
 
-    /// Load model from safetensors file.
+    fn select_weights_path(dir: &Path) -> Result<std::path::PathBuf> {
+        let gguf_candidates = ["model.gguf", "model-q8_0.gguf", "model-q4_0.gguf"];
+        for name in gguf_candidates {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+
+        let safetensors_path = dir.join("model.safetensors");
+        if safetensors_path.exists() {
+            return Ok(safetensors_path);
+        }
+
+        Err(candle_core::Error::msg(format!(
+            "model.safetensors or model.gguf not found in {}",
+            dir.display()
+        )))
+    }
+
+    /// Load model from safetensors or gguf file.
     #[instrument(skip(config), fields(path = %path.as_ref().display()))]
     pub fn load(
         path: impl AsRef<Path>,
@@ -105,23 +120,36 @@ impl Model {
         let path = path.as_ref();
         info!("Loading model from {}", path.display());
 
+        if path.extension().and_then(|ext| ext.to_str()) == Some("gguf") {
+            let vb = quantized_vb::VarBuilder::from_gguf(path, device)?;
+            return Self::from_weights(Weights::Quantized(vb), config, device);
+        }
+
         // Load tensors from safetensors file
         let tensors = candle_core::safetensors::load(path, device)?;
 
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
 
-        Self::from_vb(vb, config, device)
+        Self::from_weights(Weights::Standard(vb), config, device)
     }
 
     /// Create model from VarBuilder (for testing or custom loading).
     pub fn from_vb(vb: VarBuilder, config: AcousticModelConfig, device: &Device) -> Result<Self> {
+        Self::from_weights(Weights::Standard(vb), config, device)
+    }
+
+    fn from_weights(
+        weights: Weights<'_>,
+        config: AcousticModelConfig,
+        device: &Device,
+    ) -> Result<Self> {
         // Qwen3-TTS format: talker.model.*, talker.text_projection.*, talker.codec_head.*
-        let vb_talker = vb.pp("talker");
+        let vb_talker = weights.pp("talker");
         let vb_model = vb_talker.pp("model");
 
         // Text embedding layer [vocab_size, embedding_dim]
         // Qwen3-TTS: talker.model.text_embedding.weight [151936, 2048]
-        let text_embedding = embedding(
+        let text_embedding = embedding_from_weights(
             config.text_vocab_size,
             config.embedding_dim,
             vb_model.pp("text_embedding"),
@@ -129,10 +157,10 @@ impl Model {
         .or_else(|e| {
             warn!("Failed to load text_embedding from talker.model: {}", e);
             // Fallback to standard format
-            embedding(
+            embedding_from_weights(
                 config.text_vocab_size,
                 config.embedding_dim,
-                vb.pp("model.embed_tokens"),
+                weights.clone().pp("model.embed_tokens"),
             )
         })?;
 
@@ -162,7 +190,7 @@ impl Model {
 
         // Codec embedding layer [codec_vocab_size, hidden_size]
         // Qwen3-TTS: talker.model.codec_embedding.weight [3072, 1024]
-        let codec_embedding = embedding(
+        let codec_embedding = embedding_from_weights(
             config.codec_vocab_size,
             config.hidden_size,
             vb_model.pp("codec_embedding"),
@@ -177,11 +205,12 @@ impl Model {
         }
 
         // Final norm
-        let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
+        let norm =
+            rms_norm_from_weights(config.hidden_size, config.rms_norm_eps, vb_model.pp("norm"))?;
 
         // Codec head (outputs to codec vocabulary)
         // Qwen3-TTS: talker.codec_head.weight [3072, 1024]
-        let codec_head = candle_nn::linear_no_bias(
+        let codec_head = linear_no_bias(
             config.hidden_size,
             config.codec_vocab_size,
             vb_talker.pp("codec_head"),
@@ -189,10 +218,10 @@ impl Model {
         .or_else(|e| {
             warn!("Failed to load codec_head from talker: {}", e);
             // Fallback to lm_head
-            candle_nn::linear(
+            linear(
                 config.hidden_size,
                 config.codec_vocab_size,
-                vb.pp("lm_head"),
+                weights.clone().pp("lm_head"),
             )
         })?;
 
@@ -578,8 +607,6 @@ impl Model {
         let mut sampler = Sampler::new(sampling_config.clone());
         let mut generated_zeroth: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut all_frames: Vec<Vec<u32>> = Vec::with_capacity(max_new_tokens);
-        // Note: We only keep the last hidden state to save memory
-        let mut last_hidden_state: Option<Tensor> = None;
 
         // Suppress tokens: special tokens (2048-3071) except EOS
         let suppress_start = 2048u32;
@@ -652,7 +679,7 @@ impl Model {
         }
 
         generated_zeroth.push(current_zeroth_token);
-        last_hidden_state = Some(hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone());
+        let mut last_hidden_state = hidden_states.i((.., seq_len - 1..seq_len, ..))?.clone();
 
         // Predict residual codebooks for first token using CodePredictor
         let first_hidden = hidden_states.i((.., seq_len - 1..seq_len, ..))?;
@@ -788,7 +815,7 @@ impl Model {
             }
 
             // Keep only last hidden state to save memory
-            last_hidden_state = Some(hidden_states.clone());
+            last_hidden_state = hidden_states.clone();
 
             generated_zeroth.push(next_zeroth);
 
@@ -820,13 +847,8 @@ impl Model {
             all_frames.len()
         );
 
-        // Return last hidden state only (or empty tensor)
-        let final_hidden = last_hidden_state.unwrap_or_else(|| {
-            Tensor::zeros((1, 1, self.config.hidden_size), DType::F32, &self.device)
-                .expect("Failed to create empty hidden state")
-        });
-
-        Ok((generated_zeroth, all_frames, final_hidden))
+        // Return last hidden state only
+        Ok((generated_zeroth, all_frames, last_hidden_state))
     }
 
     /// Suppress special tokens in logits (set to -inf) except for EOS token.

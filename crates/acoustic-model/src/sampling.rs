@@ -73,6 +73,7 @@ impl SamplingConfig {
 pub struct Sampler {
     config: SamplingConfig,
     rng: StdRng,
+    probs: Vec<f32>,
 }
 
 /// Apply repetition penalty to logits for previously generated tokens.
@@ -107,7 +108,11 @@ impl Sampler {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_entropy(),
         };
-        Self { config, rng }
+        Self {
+            config,
+            rng,
+            probs: Vec::new(),
+        }
     }
 
     /// Sample a token from logits.
@@ -132,7 +137,9 @@ impl Sampler {
         };
 
         // Convert to probabilities via softmax
-        let mut probs = softmax(&scaled);
+        self.probs.clear();
+        softmax_into(&scaled, &mut self.probs);
+        let probs = &mut self.probs;
 
         // Apply top-k filtering
         if self.config.top_k > 0 && self.config.top_k < probs.len() {
@@ -192,7 +199,7 @@ impl Sampler {
         }
 
         // Sample from the distribution
-        if let Ok(dist) = WeightedIndex::new(&probs) {
+        if let Ok(dist) = WeightedIndex::new(probs.as_slice()) {
             dist.sample(&mut self.rng) as u32
         } else {
             // Fallback to argmax
@@ -216,20 +223,30 @@ impl Sampler {
     }
 }
 
-/// Compute softmax of a slice of values.
+#[cfg(test)]
 fn softmax(logits: &[f32]) -> Vec<f32> {
+    let mut out = Vec::new();
+    softmax_into(logits, &mut out);
+    out
+}
+
+fn softmax_into(logits: &[f32], out: &mut Vec<f32>) {
+    out.clear();
     if logits.is_empty() {
-        return Vec::new();
+        return;
     }
 
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
+    out.extend(logits.iter().map(|&x| (x - max).exp()));
+    let sum: f32 = out.iter().sum();
 
     if sum > 0.0 {
-        exp.iter().map(|&x| x / sum).collect()
+        for value in out.iter_mut() {
+            *value /= sum;
+        }
     } else {
-        vec![1.0 / logits.len() as f32; logits.len()]
+        out.clear();
+        out.resize(logits.len(), 1.0 / logits.len() as f32);
     }
 }
 

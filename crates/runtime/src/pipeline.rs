@@ -2,7 +2,7 @@
 //!
 //! Combines all components: normalizer → tokenizer → acoustic model → codec.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_core::Device;
@@ -19,6 +19,8 @@ use tts_core::{
     AudioChunk, AudioCodec, Lang, NormText, SynthesisRequest, TextNormalizer, TextTokenizer,
     TtsError, TtsResult,
 };
+
+use crate::profiler::Profiler;
 
 /// Backend selection for the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,8 +198,8 @@ impl TtsPipeline {
         info!("Audio codec loaded");
 
         // Try to load acoustic model if weights exist
-        let weights_path = talker_dir.join("model.safetensors");
-        let acoustic = if weights_path.exists() {
+        let weights_path = Self::find_talker_weights(talker_dir);
+        let acoustic = if let Some(weights_path) = weights_path {
             info!("Loading acoustic model from {}", talker_dir.display());
             match AcousticModel::from_pretrained(talker_dir, device) {
                 Ok(model) => {
@@ -222,7 +224,7 @@ impl TtsPipeline {
                 }
             }
         } else {
-            info!("No model.safetensors found, using mock acoustic backend");
+            info!("No model weights found, using mock acoustic backend");
             AcousticBackend::Mock
         };
 
@@ -246,6 +248,20 @@ impl TtsPipeline {
             special_tokens: Qwen3TTSTokens::default(),
             device: device.clone(),
         })
+    }
+
+    fn find_talker_weights(model_dir: &Path) -> Option<PathBuf> {
+        let candidates = [
+            "model.gguf",
+            "model-q8_0.gguf",
+            "model-q4_0.gguf",
+            "model.safetensors",
+        ];
+
+        candidates
+            .iter()
+            .map(|name| model_dir.join(name))
+            .find(|path| path.exists())
     }
 
     /// Detect if this is a CustomVoice model by checking config.json for spk_id.
@@ -1213,27 +1229,36 @@ impl TtsPipeline {
         lang: Option<Lang>,
         speaker: Option<&str>,
     ) -> TtsResult<AudioChunk> {
+        let mut profiler = Profiler::default();
         let lang = lang.unwrap_or(self.config.default_lang);
 
         // 1. Normalize
-        let normalized = self.normalize(text, Some(lang))?;
-        debug!(normalized = %normalized.text, "Text normalized");
+        {
+            let _p = profiler.section("normalization");
+            let normalized = self.normalize(text, Some(lang))?;
+            debug!(normalized = %normalized.text, "Text normalized");
+        }
 
         // 2. Tokenize
-        let text_tokens = self.tokenize(&normalized)?;
-        debug!(num_tokens = text_tokens.len(), "Text tokenized");
+        let text_tokens = {
+            let _p = profiler.section("tokenization");
+            let tokens = self.tokenize(&self.normalize(text, Some(lang))?)?;
+            debug!(num_tokens = tokens.len(), "Text tokenized");
+            tokens
+        };
 
         // 3. Generate acoustic tokens with speaker
-        let acoustic_tokens = self.generate_acoustic_with_options(
-            &text_tokens,
-            speaker,
-            lang,
-            self.config.max_seq_len,
-        )?;
-        debug!(
-            num_acoustic = acoustic_tokens.len(),
-            "Acoustic tokens generated"
-        );
+        let acoustic_tokens = {
+            let _p = profiler.section("acoustic_generation");
+            let tokens = self.generate_acoustic_with_options(
+                &text_tokens,
+                speaker,
+                lang,
+                self.config.max_seq_len,
+            )?;
+            debug!(num_acoustic = tokens.len(), "Acoustic tokens generated");
+            tokens
+        };
 
         // 4. acoustic_tokens is in interleaved format: [c0_f0, c1_f0, ..., c15_f0, c0_f1, ...]
         // Convert to multi-codebook format: Vec<Vec<u32>> where each inner Vec is one codebook
@@ -1245,36 +1270,48 @@ impl TtsPipeline {
         }
 
         // Reshape interleaved to [num_codebooks][num_frames]
-        let mut multi_tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(num_frames); NUM_CODEBOOKS];
-        for frame_idx in 0..num_frames {
-            for cb_idx in 0..NUM_CODEBOOKS {
-                let token = acoustic_tokens[frame_idx * NUM_CODEBOOKS + cb_idx];
-                // Clamp tokens to valid range (0-2047)
-                let clamped = if token >= 2048 { 0 } else { token };
-                multi_tokens[cb_idx].push(clamped);
+        let multi_tokens = {
+            let _p = profiler.section("token_reshape");
+            let mut tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(num_frames); NUM_CODEBOOKS];
+            for frame_idx in 0..num_frames {
+                for cb_idx in 0..NUM_CODEBOOKS {
+                    let token = acoustic_tokens[frame_idx * NUM_CODEBOOKS + cb_idx];
+                    // Clamp tokens to valid range (0-2047)
+                    let clamped = if token >= 2048 { 0 } else { token };
+                    tokens[cb_idx].push(clamped);
+                }
             }
-        }
-
-        debug!(
-            num_frames = num_frames,
-            codebooks = NUM_CODEBOOKS,
-            "Converted interleaved to multi-codebook format"
-        );
+            debug!(
+                num_frames = num_frames,
+                codebooks = NUM_CODEBOOKS,
+                "Converted interleaved to multi-codebook format"
+            );
+            tokens
+        };
 
         // 5. Decode using multi-codebook decoder
-        let audio = self.codec.decode_multi(&multi_tokens)?;
+        let audio = {
+            let _p = profiler.section("codec_decode");
+            self.codec.decode_multi(&multi_tokens)?
+        };
 
         // 6. Apply post-processing to smooth frame boundary discontinuities
-        let mut pcm: Vec<f32> = audio.pcm.to_vec();
-        smooth_frame_boundaries_default(&mut pcm);
-        smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
-        let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
+        let audio = {
+            let _p = profiler.section("post_process");
+            let mut pcm: Vec<f32> = audio.pcm.to_vec();
+            smooth_frame_boundaries_default(&mut pcm);
+            smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
+            let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
+            debug!(
+                samples = audio.num_samples(),
+                duration_ms = audio.duration_ms(),
+                "Audio decoded"
+            );
+            audio
+        };
 
-        debug!(
-            samples = audio.num_samples(),
-            duration_ms = audio.duration_ms(),
-            "Audio decoded"
-        );
+        // Print profiling summary
+        profiler.summary();
 
         Ok(audio)
     }
@@ -1290,42 +1327,55 @@ impl TtsPipeline {
         lang: Option<Lang>,
         speaker: Option<&str>,
     ) -> TtsResult<AudioChunk> {
+        let mut profiler = Profiler::default();
         let lang = lang.unwrap_or(self.config.default_lang);
 
         // 1. Normalize
-        let normalized = self.normalize(text, Some(lang))?;
-        debug!(normalized = %normalized.text, "Text normalized");
+        let normalized = {
+            let _p = profiler.section("normalization");
+            let normalized = self.normalize(text, Some(lang))?;
+            debug!(normalized = %normalized.text, "Text normalized");
+            normalized
+        };
 
         // 2. Tokenize
-        let text_tokens = self.tokenize(&normalized)?;
-        debug!(num_tokens = text_tokens.len(), "Text tokenized");
+        let text_tokens = {
+            let _p = profiler.section("tokenization");
+            let tokens = self.tokenize(&normalized)?;
+            debug!(num_tokens = tokens.len(), "Text tokenized");
+            tokens
+        };
 
         // 3. Generate multi-codebook acoustic tokens
-        let multi_tokens = match &self.acoustic {
-            AcousticBackend::Neural {
-                model,
-                code_predictor,
-            } => {
-                let actual_speaker = speaker.or(self.config.default_speaker.as_deref());
-                self.generate_acoustic_multi_codebook(
+        let multi_tokens = {
+            let _p = profiler.section("acoustic_generation");
+            match &self.acoustic {
+                AcousticBackend::Neural {
                     model,
-                    code_predictor.as_deref(),
-                    &text_tokens,
-                    actual_speaker,
-                    lang,
-                    self.config.max_seq_len,
-                )?
-            }
-            AcousticBackend::Mock => {
-                // Mock: generate single codebook and pad
-                let tokens = self.generate_acoustic_mock(&text_tokens, self.config.max_seq_len)?;
-                let seq_len = tokens.len();
-                let mut result = Vec::with_capacity(16);
-                result.push(tokens);
-                for _ in 1..16 {
-                    result.push(vec![0u32; seq_len]);
+                    code_predictor,
+                } => {
+                    let actual_speaker = speaker.or(self.config.default_speaker.as_deref());
+                    self.generate_acoustic_multi_codebook(
+                        model,
+                        code_predictor.as_deref(),
+                        &text_tokens,
+                        actual_speaker,
+                        lang,
+                        self.config.max_seq_len,
+                    )?
                 }
-                result
+                AcousticBackend::Mock => {
+                    // Mock: generate single codebook and pad
+                    let tokens =
+                        self.generate_acoustic_mock(&text_tokens, self.config.max_seq_len)?;
+                    let seq_len = tokens.len();
+                    let mut result = Vec::with_capacity(16);
+                    result.push(tokens);
+                    for _ in 1..16 {
+                        result.push(vec![0u32; seq_len]);
+                    }
+                    result
+                }
             }
         };
 
@@ -1336,19 +1386,29 @@ impl TtsPipeline {
         );
 
         // 4. Decode using multi-codebook decoder
-        let audio = self.codec.decode_multi(&multi_tokens)?;
+        let audio = {
+            let _p = profiler.section("codec_decode");
+            self.codec.decode_multi(&multi_tokens)?
+        };
 
         // 5. Apply post-processing to smooth frame boundary discontinuities
-        let mut pcm: Vec<f32> = audio.pcm.to_vec();
-        smooth_frame_boundaries_default(&mut pcm);
-        smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
-        let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
+        let audio = {
+            let _p = profiler.section("post_process");
+            let mut pcm: Vec<f32> = audio.pcm.to_vec();
+            smooth_frame_boundaries_default(&mut pcm);
+            smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
+            let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
 
-        debug!(
-            samples = audio.num_samples(),
-            duration_ms = audio.duration_ms(),
-            "Audio decoded (multi-codebook)"
-        );
+            debug!(
+                samples = audio.num_samples(),
+                duration_ms = audio.duration_ms(),
+                "Audio decoded (multi-codebook)"
+            );
+
+            audio
+        };
+
+        profiler.summary();
 
         Ok(audio)
     }

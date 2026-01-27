@@ -26,17 +26,27 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use acoustic_model::{Model, CodePredictor, config::AcousticModelConfig, sampling::SamplingConfig};
-//! use candle_core::Device;
+//! ```
+//! use std::path::PathBuf;
 //!
-//! let config = AcousticModelConfig::default();
-//! let device = Device::Cpu;
-//! let model = Model::load("model.safetensors", config, &device)?;
+//! use acoustic_model::{config::AcousticModelConfig, Model};
+//! use candle_core::{Device, Result, Tensor};
 //!
-//! let input_tokens = vec![1, 2, 3, 4];
-//! let sampling = SamplingConfig::default();
-//! let output = model.generate(&input_tokens, 100, sampling, Some(2))?;
+//! fn main() -> Result<()> {
+//!     let config = AcousticModelConfig::default();
+//!     let device = Device::Cpu;
+//!     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+//!         .join("..")
+//!         .join("..")
+//!         .join("models")
+//!         .join("qwen3-tts-0.6b-customvoice");
+//!     let weights = model_dir.join("model.gguf");
+//!     let model = Model::load(weights, config, &device)?;
+//!
+//!     let input_ids = Tensor::from_vec(vec![1u32], (1, 1), &device)?;
+//!     let _logits = model.forward(&input_ids, 0, None)?;
+//!     Ok(())
+//! }
 //! ```
 
 pub mod cache;

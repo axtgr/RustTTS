@@ -1,10 +1,95 @@
 //! Neural network layers for the acoustic model.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder, embedding};
+use candle_transformers::quantized_nn;
+use candle_transformers::quantized_var_builder as quantized_vb;
 
 use crate::cache::LayerKvCache;
 use crate::config::AcousticModelConfig;
+
+#[derive(Clone)]
+pub enum Weights<'a> {
+    Standard(VarBuilder<'a>),
+    Quantized(quantized_vb::VarBuilder),
+}
+
+impl<'a> Weights<'a> {
+    pub fn pp<S: ToString>(&self, s: S) -> Self {
+        match self {
+            Self::Standard(vb) => Self::Standard(vb.pp(s)),
+            Self::Quantized(vb) => Self::Quantized(vb.pp(s)),
+        }
+    }
+
+    pub fn device(&self) -> &Device {
+        match self {
+            Self::Standard(vb) => vb.device(),
+            Self::Quantized(vb) => vb.device(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LinearLayer {
+    Standard(candle_nn::Linear),
+    Quantized(quantized_nn::Linear),
+}
+
+impl LinearLayer {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(linear) => linear.forward(x),
+            Self::Quantized(linear) => linear.forward(x),
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized(_))
+    }
+}
+
+pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: Weights<'_>) -> Result<LinearLayer> {
+    match vb {
+        Weights::Standard(vb) => Ok(LinearLayer::Standard(candle_nn::linear_no_bias(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Quantized(vb) => Ok(LinearLayer::Quantized(quantized_nn::linear_no_bias(
+            in_dim, out_dim, vb,
+        )?)),
+    }
+}
+
+pub fn linear(in_dim: usize, out_dim: usize, vb: Weights<'_>) -> Result<LinearLayer> {
+    match vb {
+        Weights::Standard(vb) => Ok(LinearLayer::Standard(candle_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Quantized(vb) => Ok(LinearLayer::Quantized(quantized_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+    }
+}
+
+pub fn embedding_from_weights(vocab: usize, dim: usize, vb: Weights<'_>) -> Result<Embedding> {
+    match vb {
+        Weights::Standard(vb) => embedding(vocab, dim, vb),
+        Weights::Quantized(vb) => {
+            let weight = vb.get((vocab, dim), "weight")?.dequantize(vb.device())?;
+            Ok(Embedding::new(weight, dim))
+        }
+    }
+}
+
+pub fn rms_norm_from_weights(size: usize, eps: f64, vb: Weights<'_>) -> Result<RmsNorm> {
+    match vb {
+        Weights::Standard(vb) => RmsNorm::new(size, eps, vb),
+        Weights::Quantized(vb) => {
+            let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
+            RmsNorm::from_weight(weight, eps)
+        }
+    }
+}
 
 /// Trait for rotary position embeddings.
 ///
@@ -36,6 +121,10 @@ impl RmsNorm {
     /// Create RMSNorm with ones initialization (for testing).
     pub fn new_ones(hidden_size: usize, eps: f64, device: &Device) -> Result<Self> {
         let weight = Tensor::ones((hidden_size,), DType::F32, device)?;
+        Ok(Self { weight, eps })
+    }
+
+    pub fn from_weight(weight: Tensor, eps: f64) -> Result<Self> {
         Ok(Self { weight, eps })
     }
 
@@ -271,9 +360,7 @@ impl MultimodalRotaryEmbedding {
     /// - Next 24 dims from modality 2
     /// - Repeat for second half
     fn combine_concatenated(&self, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-        let seq_len = cos.dim(1)?;
         let half_dim = cos.dim(2)?;
-        let device = cos.device();
 
         // Double the section: [s0, s1, s2, s0, s1, s2]
         let doubled_section: Vec<usize> = self
@@ -430,10 +517,10 @@ fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 /// Multi-head attention layer with GQA support and optional QK-Norm.
 #[derive(Debug)]
 pub struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: LinearLayer,
+    k_proj: LinearLayer,
+    v_proj: LinearLayer,
+    o_proj: LinearLayer,
     /// Optional Q normalization (per head_dim).
     q_norm: Option<RmsNorm>,
     /// Optional K normalization (per head_dim).
@@ -449,37 +536,37 @@ impl Attention {
     ///
     /// Qwen3-TTS uses QK-Norm (per-head RMSNorm on Q and K after projection).
     /// Attention projections have no bias (attention_bias: false in config).
-    pub fn new(config: &AcousticModelConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &AcousticModelConfig, vb: Weights<'_>) -> Result<Self> {
         let head_dim = config.head_dim;
 
         // Q projection: hidden_size -> num_heads * head_dim (no bias)
-        let q_proj = candle_nn::linear_no_bias(
+        let q_proj = linear_no_bias(
             config.hidden_size,
             config.num_attention_heads * head_dim,
             vb.pp("q_proj"),
         )?;
         // K projection: hidden_size -> num_kv_heads * head_dim (no bias)
-        let k_proj = candle_nn::linear_no_bias(
+        let k_proj = linear_no_bias(
             config.hidden_size,
             config.num_kv_heads * head_dim,
             vb.pp("k_proj"),
         )?;
         // V projection: hidden_size -> num_kv_heads * head_dim (no bias)
-        let v_proj = candle_nn::linear_no_bias(
+        let v_proj = linear_no_bias(
             config.hidden_size,
             config.num_kv_heads * head_dim,
             vb.pp("v_proj"),
         )?;
         // O projection: num_heads * head_dim -> hidden_size (no bias)
-        let o_proj = candle_nn::linear_no_bias(
+        let o_proj = linear_no_bias(
             config.num_attention_heads * head_dim,
             config.hidden_size,
             vb.pp("o_proj"),
         )?;
 
         // Try to load QK-Norm weights (Qwen3-TTS specific)
-        let q_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("q_norm")).ok();
-        let k_norm = RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("k_norm")).ok();
+        let q_norm = rms_norm_from_weights(head_dim, config.rms_norm_eps, vb.pp("q_norm")).ok();
+        let k_norm = rms_norm_from_weights(head_dim, config.rms_norm_eps, vb.pp("k_norm")).ok();
 
         Ok(Self {
             q_proj,
@@ -501,7 +588,7 @@ impl Attention {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        mut kv_cache: Option<&mut LayerKvCache>,
+        kv_cache: Option<&mut LayerKvCache>,
     ) -> Result<Tensor> {
         self.forward_with_debug(x, rope, position_offset, kv_cache, false)
     }
@@ -516,6 +603,14 @@ impl Attention {
         debug: bool,
     ) -> Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
+
+        if position_offset == 0 {
+            let quantized = self.q_proj.is_quantized()
+                || self.k_proj.is_quantized()
+                || self.v_proj.is_quantized()
+                || self.o_proj.is_quantized();
+            tracing::debug!(quantized, "Attention projections ready");
+        }
 
         // Project Q, K, V
         let q = self.q_proj.forward(x)?;
@@ -556,6 +651,9 @@ impl Attention {
 
         // Apply rotary embeddings
         let (q, k) = rope.apply(&q, &k, position_offset)?;
+        let q = maybe_contiguous(q)?;
+        let k = maybe_contiguous(k)?;
+        let v = maybe_contiguous(v)?;
 
         if debug {
             let q_rope: Vec<f32> = q.i((0, 0, seq_len - 1, ..10))?.to_vec1()?;
@@ -609,7 +707,10 @@ impl Attention {
         }
 
         // Causal mask
-        let mask = create_causal_mask(seq_len, total_seq_len, x.device())?;
+        let mask = match kv_cache.as_deref_mut() {
+            Some(cache) => get_or_create_causal_mask(cache, seq_len, total_seq_len, x.device())?,
+            None => create_causal_mask(seq_len, total_seq_len, x.device())?,
+        };
         let attn_weights = attn_weights.broadcast_add(&mask)?;
 
         if debug {
@@ -704,6 +805,14 @@ impl Attention {
     }
 }
 
+fn maybe_contiguous(tensor: Tensor) -> Result<Tensor> {
+    if matches!(tensor.device(), Device::Metal(_)) {
+        tensor.contiguous()
+    } else {
+        Ok(tensor)
+    }
+}
+
 /// Repeat KV heads for GQA.
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
@@ -716,55 +825,70 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
         .expand((batch, num_kv_heads, n_rep, seq_len, head_dim))?
         .reshape((batch, num_kv_heads * n_rep, seq_len, head_dim))?;
 
-    Ok(x)
+    maybe_contiguous(x)
 }
 
 /// Create a causal attention mask.
 fn create_causal_mask(query_len: usize, key_len: usize, device: &Device) -> Result<Tensor> {
-    // Create lower triangular mask manually
     let mut mask_data = vec![0.0f32; query_len * key_len];
+
     for i in 0..query_len {
         for j in 0..key_len {
-            // For causal mask: position i can attend to positions 0..=i+(key_len-query_len)
             let offset = key_len - query_len;
             if j <= i + offset {
-                mask_data[i * key_len + j] = 0.0; // Can attend
+                mask_data[i * key_len + j] = 0.0;
             } else {
-                mask_data[i * key_len + j] = f32::NEG_INFINITY; // Cannot attend
+                mask_data[i * key_len + j] = f32::NEG_INFINITY;
             }
         }
     }
 
     let mask = Tensor::from_vec(mask_data, (query_len, key_len), device)?;
 
-    // Add batch and head dimensions
     mask.unsqueeze(0)?.unsqueeze(0)
+}
+
+fn get_or_create_causal_mask(
+    cache: &mut LayerKvCache,
+    query_len: usize,
+    key_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if let Some((cached_q, cached_k, mask)) = &cache.cached_mask {
+        if *cached_q == query_len && *cached_k == key_len {
+            return Ok(mask.clone());
+        }
+    }
+
+    let mask = create_causal_mask(query_len, key_len, device)?;
+    cache.cached_mask = Some((query_len, key_len, mask.clone()));
+    Ok(mask)
 }
 
 /// MLP layer with SwiGLU activation.
 #[derive(Debug)]
 pub struct MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: LinearLayer,
+    up_proj: LinearLayer,
+    down_proj: LinearLayer,
 }
 
 impl MLP {
     /// Create a new MLP layer.
     ///
     /// Qwen3-TTS MLP has no bias on any projections.
-    pub fn new(config: &AcousticModelConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = candle_nn::linear_no_bias(
+    pub fn new(config: &AcousticModelConfig, vb: Weights<'_>) -> Result<Self> {
+        let gate_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("gate_proj"),
         )?;
-        let up_proj = candle_nn::linear_no_bias(
+        let up_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("up_proj"),
         )?;
-        let down_proj = candle_nn::linear_no_bias(
+        let down_proj = linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
@@ -798,14 +922,14 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     /// Create a new transformer block.
-    pub fn new(config: &AcousticModelConfig, vb: VarBuilder) -> Result<Self> {
-        let input_layernorm = RmsNorm::new(
+    pub fn new(config: &AcousticModelConfig, vb: Weights<'_>) -> Result<Self> {
+        let input_layernorm = rms_norm_from_weights(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
-        let post_attention_layernorm = RmsNorm::new(
+        let post_attention_layernorm = rms_norm_from_weights(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -826,7 +950,7 @@ impl TransformerBlock {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        mut kv_cache: Option<&mut LayerKvCache>,
+        kv_cache: Option<&mut LayerKvCache>,
     ) -> Result<Tensor> {
         self.forward_with_debug(x, rope, position_offset, kv_cache, false)
     }
@@ -837,7 +961,7 @@ impl TransformerBlock {
         x: &Tensor,
         rope: &R,
         position_offset: usize,
-        mut kv_cache: Option<&mut LayerKvCache>,
+        kv_cache: Option<&mut LayerKvCache>,
         debug: bool,
     ) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
@@ -904,17 +1028,17 @@ impl TransformerBlock {
 /// Architecture: Linear(2048, 2048) -> SiLU -> Linear(2048, 1024)
 #[derive(Debug)]
 pub struct TextProjection {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: LinearLayer,
+    fc2: LinearLayer,
 }
 
 impl TextProjection {
     /// Create a new text projection layer.
     ///
     /// TextProjection has bias unlike attention/MLP layers.
-    pub fn new(embedding_dim: usize, hidden_size: usize, vb: VarBuilder) -> Result<Self> {
-        let fc1 = candle_nn::linear(embedding_dim, embedding_dim, vb.pp("linear_fc1"))?;
-        let fc2 = candle_nn::linear(embedding_dim, hidden_size, vb.pp("linear_fc2"))?;
+    pub fn new(embedding_dim: usize, hidden_size: usize, vb: Weights<'_>) -> Result<Self> {
+        let fc1 = linear(embedding_dim, embedding_dim, vb.pp("linear_fc1"))?;
+        let fc2 = linear(embedding_dim, hidden_size, vb.pp("linear_fc2"))?;
         Ok(Self { fc1, fc2 })
     }
 

@@ -11,11 +11,16 @@
 //! - Structured logging and metrics
 //! - Device selection (CPU, Metal, CUDA)
 
+pub mod allocator;
 pub mod device;
 pub mod logging;
+pub mod metal_cache;
 pub mod metrics;
 pub mod pipeline;
+pub mod profiler;
 pub mod queue;
+pub mod tracing_setup;
+pub mod warm;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -4,7 +4,13 @@
 //! Metal (Apple Silicon) → CUDA (NVIDIA) → CPU
 
 use candle_core::Device;
-use tracing::{info, warn};
+use tracing::info;
+
+#[cfg(any(feature = "metal", feature = "cuda"))]
+use tracing::warn;
+
+#[cfg(feature = "metal")]
+use crate::metal_cache;
 
 use tts_core::{TtsError, TtsResult};
 
@@ -61,6 +67,9 @@ fn select_auto() -> TtsResult<Device> {
     {
         match Device::new_metal(0) {
             Ok(device) => {
+                if let Err(err) = metal_cache::warm_cache(&device) {
+                    warn!("Metal shader cache warmup failed: {}", err);
+                }
                 info!("Auto-selected Metal GPU (Apple Silicon)");
                 return Ok(device);
             }
@@ -96,6 +105,9 @@ fn select_metal() -> TtsResult<Device> {
     {
         match Device::new_metal(0) {
             Ok(device) => {
+                if let Err(err) = metal_cache::warm_cache(&device) {
+                    warn!("Metal shader cache warmup failed: {}", err);
+                }
                 info!("Using Metal GPU (Apple Silicon)");
                 Ok(device)
             }
