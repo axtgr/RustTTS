@@ -13,7 +13,8 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["audio-codec-12hz/cuda"]
+cuda = ["runtime/cuda", "audio-codec-12hz/cuda"]
+metal = ["runtime/metal", "audio-codec-12hz/metal"]
 
 [dependencies]
 # Internal crates

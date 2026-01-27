@@ -35,6 +35,7 @@ enum Commands {
     /// Synthesize text to audio
     Synth {
         /// Input text or file path (use @file.txt for file input)
+        #[arg(short, long)]
         input: String,
 
         /// Output file path (WAV format)
@@ -74,11 +75,16 @@ enum Commands {
         /// May improve audio quality compared to single-codebook (zeroth) decoding
         #[arg(long)]
         multi_codebook: bool,
+
+        /// Device to use (auto, cpu, cuda, metal)
+        #[arg(long, default_value = "auto")]
+        device: String,
     },
 
     /// Normalize text without synthesis (dry run)
     Normalize {
         /// Input text
+        #[arg(short, long)]
         input: String,
 
         /// Language hint (ru, en, or mixed)
@@ -89,6 +95,7 @@ enum Commands {
     /// Tokenize text (dry run)
     Tokenize {
         /// Input text
+        #[arg(short, long)]
         input: String,
 
         /// Tokenizer model path
@@ -140,6 +147,7 @@ async fn main() -> Result<()> {
             seed,
             streaming,
             multi_codebook,
+            device,
         } => {
             let synth_options = commands::synth::SynthOptions {
                 input,
@@ -151,6 +159,7 @@ async fn main() -> Result<()> {
                 model_config,
                 seed,
                 multi_codebook,
+                device_preference: runtime::device::DevicePreference::from_str(&device),
             };
 
             if streaming {

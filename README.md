@@ -16,20 +16,57 @@
 
 ## Быстрый старт
 
+### Apple Silicon (Metal) ускорение
+
+Для владельцев M1/M2/M3 рекомендуется использовать feature-флаг `metal` для ускорения инференса (MPS):
+
+```bash
+# Сборка с поддержкой Metal
+cargo build --release --features metal
+
+# Синтез на GPU
+cargo run -p tts-cli --release --features metal -- synth \
+  --input "Тест GPU ускорения" \
+  --output test_metal.wav \
+  --device metal
+```
+
 ### CLI синтез
 
 ```bash
-# Сборка
+# Сборка (CPU)
 cargo build --release
 
-# Синтез текста в WAV
-cargo run -p tts-cli --release -- synth "Привет, мир!" -o output.wav
+# Синтез текста в WAV (автоматический выбор устройства)
+cargo run -p tts-cli --release -- synth --input "Привет, мир!" -o output.wav
+
+# Явное указание устройства
+cargo run -p tts-cli --release --features metal -- synth \
+  --input "Текст" \
+  --output out.wav \
+  --device metal  # варианты: auto, cpu, metal, cuda
 
 # Streaming режим
-cargo run -p tts-cli --release -- synth "Длинный текст для синтеза..." -o output.wav --streaming
+cargo run -p tts-cli --release -- synth --input "Длинный текст..." -o output.wav --streaming
 
 # Нормализация текста (dry run)
-cargo run -p tts-cli --release -- normalize "100 рублей" --lang ru
+cargo run -p tts-cli --release -- normalize --input "100 рублей" --lang ru
+```
+
+### Desktop App (GUI)
+
+Приложение на базе Tauri v2.
+
+```bash
+# Установка Tauri CLI (если еще нет)
+cargo install tauri-cli --version "^2.0.0"
+
+# Запуск в режиме разработки (из папки crates/tts-app)
+cd crates/tts-app
+cargo tauri dev
+
+# Запуск с поддержкой Metal
+cargo tauri dev --features metal
 ```
 
 ### gRPC сервер
@@ -80,6 +117,7 @@ grpcurl -plaintext -d '{"text": "Привет мир", "language": 1}' \
 | `runtime` | Pipeline, streaming, batching |
 | `tts-cli` | Командная строка |
 | `tts-server` | gRPC + HTTP сервер |
+| `tts-app` | Desktop приложение (Tauri) |
 
 ## Статус разработки
 

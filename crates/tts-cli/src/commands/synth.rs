@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use candle_core::Device;
 use tracing::{debug, info};
 
 use audio_codec_12hz::wav::{DEFAULT_FADE_IN_MS, apply_fade_in, write_wav};
-use runtime::TtsPipeline;
+use runtime::{
+    TtsPipeline,
+    device::{DevicePreference, select_device},
+};
 use tts_core::Lang;
 
 /// Options for synthesis command.
@@ -28,6 +30,8 @@ pub struct SynthOptions {
     pub seed: Option<u64>,
     /// Use multi-codebook decoding (all 16 codebooks via CodePredictor).
     pub multi_codebook: bool,
+    /// Device preference (Auto, Cpu, Metal, Cuda).
+    pub device_preference: DevicePreference,
 }
 
 /// Create pipeline based on options.
@@ -40,14 +44,29 @@ fn create_pipeline(options: &SynthOptions) -> Result<TtsPipeline> {
 
         // Codec dir - use provided or default
         let codec_dir = options.codec_dir.clone().unwrap_or_else(|| {
-            // Try to find codec in parent directory
+            // 1. Try finding speech_tokenizer inside model_dir (bundled codec)
+            let bundled = model_dir.join("speech_tokenizer");
+            if bundled.exists() {
+                debug!(path = %bundled.display(), "Found bundled speech_tokenizer");
+                return bundled;
+            }
+
+            // 2. Try to find codec in parent directory
             model_dir
                 .parent()
                 .map(|p| p.join("qwen3-tts-tokenizer"))
                 .unwrap_or_else(|| PathBuf::from("models/qwen3-tts-tokenizer"))
         });
 
-        let device = Device::Cpu;
+        // Ensure model.safetensors exists to avoid silent fallback to Mock
+        if !model_dir.join("model.safetensors").exists() {
+            bail!(
+                "Acoustic model weights (model.safetensors) not found in directory: {}",
+                model_dir.display()
+            );
+        }
+
+        let device = select_device(options.device_preference)?;
 
         let pipeline = TtsPipeline::from_pretrained(model_dir, tokenizer_dir, &codec_dir, &device)?;
 
@@ -256,6 +275,7 @@ mod tests {
             model_config: None,
             seed: None,
             multi_codebook: false,
+            device_preference: DevicePreference::Auto,
         }
     }
 
