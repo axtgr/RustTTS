@@ -9,16 +9,24 @@
 ## Ключевые особенности
 
 - **Pure Rust:** Никакого Python в runtime
-- **High Performance:** P95 latency < 400ms (GPU), поддержка CUDA
-- **Streaming:** Генерация и отдача аудио чанками по 20-100 мс
-- **gRPC Server:** Production-ready сервер с health checks и метриками
+- **Производительность:** оптимизация под CPU/Metal/CUDA
+- **Квантизация:** поддержка GGUF Q8/Q4 и safetensors
+- **Streaming:** генерация и отдача аудио чанками по 20-100 мс
+- **gRPC Server:** production-ready сервер с health checks и метриками
 - **Modular Architecture:** 8 независимых crates
+
+## Модель и веса
+
+- Поддерживаются `model.safetensors`, `model.gguf`, `model-q8_0.gguf`, `model-q4_0.gguf`
+- Приоритет выбора: `model.gguf` → `model-q8_0.gguf` → `model-q4_0.gguf` → `model.safetensors`
+- Для CustomVoice используйте директорию `models/qwen3-tts-0.6b-customvoice`
 
 ## Быстрый старт
 
 ### Apple Silicon (Metal) ускорение
 
-Для владельцев M1/M2/M3 рекомендуется использовать feature-флаг `metal` для ускорения инференса (MPS):
+Для владельцев Apple Silicon (включая M4) можно использовать feature-флаг `metal` для инференса на GPU (MPS).
+См. `BENCHMARK.md`: на текущих реализациях Metal в бенчмарках уступает CPU, поэтому по умолчанию рекомендуется CPU.
 
 ```bash
 # Сборка с поддержкой Metal
@@ -28,6 +36,7 @@ cargo build --release --features metal
 cargo run -p tts-cli --release --features metal -- synth \
   --input "Тест GPU ускорения" \
   --output test_metal.wav \
+  --model-dir models/qwen3-tts-0.6b-customvoice \
   --device metal
 ```
 
@@ -38,16 +47,24 @@ cargo run -p tts-cli --release --features metal -- synth \
 cargo build --release
 
 # Синтез текста в WAV (автоматический выбор устройства)
-cargo run -p tts-cli --release -- synth --input "Привет, мир!" -o output.wav
+cargo run -p tts-cli --release -- synth \
+  --input "Привет, мир!" \
+  --model-dir models/qwen3-tts-0.6b-customvoice \
+  -o output.wav
 
 # Явное указание устройства
 cargo run -p tts-cli --release --features metal -- synth \
   --input "Текст" \
+  --model-dir models/qwen3-tts-0.6b-customvoice \
   --output out.wav \
   --device metal  # варианты: auto, cpu, metal, cuda
 
 # Streaming режим
-cargo run -p tts-cli --release -- synth --input "Длинный текст..." -o output.wav --streaming
+cargo run -p tts-cli --release -- synth \
+  --input "Длинный текст..." \
+  --model-dir models/qwen3-tts-0.6b-customvoice \
+  -o output.wav \
+  --streaming
 
 # Нормализация текста (dry run)
 cargo run -p tts-cli --release -- normalize --input "100 рублей" --lang ru
@@ -119,20 +136,6 @@ grpcurl -plaintext -d '{"text": "Привет мир", "language": 1}' \
 | `tts-server` | gRPC + HTTP сервер |
 | `tts-app` | Desktop приложение (Tauri) |
 
-## Статус разработки
-
-| Фаза | Статус | Описание |
-|------|--------|----------|
-| Phase 0 | ✅ | Инфраструктура workspace |
-| Phase 1 | ✅ | Text Pipeline (normalizer, tokenizer) |
-| Phase 2 | ✅ | Acoustic Model (transformer, KV cache) |
-| Phase 3 | ✅ | Audio Codec (neural decoder, streaming) |
-| Phase 4 | ✅ | Runtime (pipeline, batching) |
-| Phase 5 | ✅ | CLI (synth, normalize, tokenize) |
-| Phase 6 | ✅ | gRPC Server (streaming, health, metrics) |
-
-**Текущий статус:** Все основные фазы завершены. Полнофункциональный TTS pipeline работает.
-
 ## Производительность
 
 Сравнение с Python SDK (Apple Silicon, MPS vs Rust CPU/Metal):
@@ -148,7 +151,7 @@ grpcurl -plaintext -d '{"text": "Привет мир", "language": 1}' \
 
 > RTF (Real-Time Factor) — отношение времени синтеза к длительности аудио. Меньше = лучше.
 
-Python быстрее на GPU для коротких запросов, Rust выигрывает на CPU по medium/long.
+Python быстрее на GPU для коротких запросов, Rust выигрывает на CPU на medium/long.
 
 Подробности: **[Benchmark](BENCHMARK.md)**
 
