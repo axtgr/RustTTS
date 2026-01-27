@@ -24,6 +24,17 @@ use tracing::{debug, info, instrument};
 
 use tts_core::{TtsError, TtsResult};
 
+/// Debug print macro - only active when `debug_decoder` feature is enabled.
+#[cfg(feature = "debug_decoder")]
+macro_rules! debug_print {
+    ($($arg:tt)*) => { debug_print!($($arg)*) };
+}
+
+#[cfg(not(feature = "debug_decoder"))]
+macro_rules! debug_print {
+    ($($arg:tt)*) => {};
+}
+
 /// Configuration for the codec decoder.
 ///
 /// Based on Qwen3-TTS-Tokenizer-12Hz architecture.
@@ -421,22 +432,22 @@ pub struct NeuralDecoder {
     rvq_first_output_proj: Option<RvqOutputProj>,
     /// RVQ output projection for rest quantizers (256→512).
     rvq_rest_output_proj: Option<RvqOutputProj>,
-    /// Pre-conv: [1024, 512, 3] projects sum to 1024-dim.
-    pre_conv: Option<Conv1d>,
+    /// Pre-conv: [1024, 512, 3] projects sum to 1024-dim (causal).
+    pre_conv: Option<CausalConv1d>,
     /// Pre-Transformer: 8-layer transformer with final norm.
     pre_transformer: Option<PreTransformer>,
     /// ConvNeXt upsample blocks (2 blocks, each 2x = 4x total).
     convnext_upsample: Option<Vec<ConvNeXtUpsampleBlock>>,
-    /// HiFi-GAN initial conv [1536, 1024, 7].
-    input_conv: Conv1d,
+    /// HiFi-GAN initial conv [1536, 1024, 7] (causal).
+    input_conv: CausalConv1d,
     /// Upsampling stages (legacy mode).
     upsample_blocks: Vec<UpsampleBlock>,
     /// HiFi-GAN upsample blocks (real Qwen3 mode).
     hifi_blocks: Option<Vec<HifiUpsampleBlock>>,
     /// Final Snake activation (for HiFi-GAN mode).
     final_snake: Option<Snake>,
-    /// Final output convolution.
-    output_conv: Conv1d,
+    /// Final output convolution (causal).
+    output_conv: CausalConv1d,
     /// Configuration.
     config: DecoderConfig,
     /// Device.
@@ -486,17 +497,19 @@ impl NeuralDecoder {
             None
         };
 
-        // Input projection from latent to decoder dimension
+        // Input projection from latent to decoder dimension (causal)
         let input_conv = conv1d(
             config.latent_dim,
             config.decoder_dim,
             7,
-            Conv1dConfig {
-                padding: 3,
-                ..Default::default()
-            },
+            Conv1dConfig::default(),
             vb.pp("input_conv"),
-        )?;
+        )
+        .map(|conv| {
+            let weight = conv.weight().clone();
+            let bias = conv.bias().cloned();
+            CausalConv1d::new(weight, bias, 7)
+        })?;
 
         // Build upsampling stages based on upsample_rates
         let mut upsample_blocks = Vec::new();
@@ -538,12 +551,14 @@ impl NeuralDecoder {
             channels,
             1,
             7,
-            Conv1dConfig {
-                padding: 3,
-                ..Default::default()
-            },
+            Conv1dConfig::default(),
             vb.pp("output_conv"),
-        )?;
+        )
+        .map(|conv| {
+            let weight = conv.weight().clone();
+            let bias = conv.bias().cloned();
+            CausalConv1d::new(weight, bias, 7)
+        })?;
 
         Ok(Self {
             codebooks,
@@ -779,27 +794,18 @@ impl NeuralDecoder {
         }
 
         // Try to load pre_conv: [1024, 512, 3]
+        // This is a CausalConvNet which uses LEFT-only padding
         let pre_conv = vb
             .pp("decoder.pre_conv.conv")
             .get((1024, 512, 3), "weight")
             .and_then(|w| {
                 let b = vb.pp("decoder.pre_conv.conv").get((1024,), "bias")?;
-                Ok((w, b))
-            })
-            .map(|(w, b)| {
-                Conv1d::new(
-                    w,
-                    Some(b),
-                    Conv1dConfig {
-                        padding: 1,
-                        ..Default::default()
-                    },
-                )
+                Ok(CausalConv1d::new(w, Some(b), 3))
             })
             .ok();
 
         if pre_conv.is_some() {
-            debug!("Loaded pre_conv [1024, 512, 3]");
+            debug!("Loaded pre_conv [1024, 512, 3] (causal)");
         }
 
         // Try to load pre_transformer (8-layer transformer)
@@ -838,7 +844,7 @@ impl NeuralDecoder {
             None
         };
 
-        // HiFi-GAN input conv: decoder.decoder.0 [1536, 1024, 7]
+        // HiFi-GAN input conv: decoder.decoder.0 [1536, 1024, 7] (CausalConvNet)
         let input_conv = vb
             .pp("decoder.decoder.0")
             .get((config.decoder_dim, config.latent_dim, 7), "conv.weight")
@@ -846,21 +852,16 @@ impl NeuralDecoder {
                 let b = vb
                     .pp("decoder.decoder.0")
                     .get((config.decoder_dim,), "conv.bias")?;
-                Ok((w, b))
-            })
-            .map(|(w, b)| {
-                Conv1d::new(
-                    w,
-                    Some(b),
-                    Conv1dConfig {
-                        padding: 3,
-                        ..Default::default()
-                    },
-                )
+                Ok(CausalConv1d::new(w, Some(b), 7))
             })
             .or_else(|_| {
                 debug!("Using random init for input_conv");
-                create_random_conv1d(config.latent_dim, config.decoder_dim, 7, device)
+                create_random_conv1d(config.latent_dim, config.decoder_dim, 7, device).map(|conv| {
+                    // Convert Conv1d to CausalConv1d
+                    let weight = conv.weight().clone();
+                    let bias = conv.bias().cloned();
+                    CausalConv1d::new(weight, bias, 7)
+                })
             })
             .map_err(|e| TtsError::internal(format!("failed to create input_conv: {e}")))?;
 
@@ -938,39 +939,35 @@ impl NeuralDecoder {
             (blocks, channels)
         };
 
-        // Load output conv with correct number of input channels
+        // Load output conv with correct number of input channels (CausalConvNet)
         let output_conv = vb
             .pp("decoder.decoder.6")
             .get((1, output_channels, 7), "conv.weight")
             .and_then(|w| {
                 let b = vb.pp("decoder.decoder.6").get((1,), "conv.bias")?;
-                Ok((w, b))
-            })
-            .map(|(w, b)| {
-                Conv1d::new(
-                    w,
-                    Some(b),
-                    Conv1dConfig {
-                        padding: 3,
-                        ..Default::default()
-                    },
-                )
+                Ok(CausalConv1d::new(w, Some(b), 7))
             })
             .or_else(|_| {
                 conv1d(
                     output_channels,
                     1,
                     7,
-                    Conv1dConfig {
-                        padding: 3,
-                        ..Default::default()
-                    },
+                    Conv1dConfig::default(),
                     vb.pp("output_conv"),
                 )
+                .map(|conv| {
+                    let weight = conv.weight().clone();
+                    let bias = conv.bias().cloned();
+                    CausalConv1d::new(weight, bias, 7)
+                })
             })
             .or_else(|_| {
                 debug!("Using random init for output_conv");
-                create_random_conv1d(output_channels, 1, 7, device)
+                create_random_conv1d(output_channels, 1, 7, device).map(|conv| {
+                    let weight = conv.weight().clone();
+                    let bias = conv.bias().cloned();
+                    CausalConv1d::new(weight, bias, 7)
+                })
             })
             .map_err(|e| TtsError::internal(format!("failed to create output_conv: {e}")))?;
 
@@ -1323,37 +1320,121 @@ impl NeuralDecoder {
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("convnext_upsample not loaded".to_string()))?;
 
-        // Step 1 & 2: RVQ dequantize with output projection for each codebook
-        // Then sum all projected embeddings (residual sum)
-        let mut sum_embedding: Option<Tensor> = None;
+        // Step 1 & 2: RVQ dequantize with proper output projection order
+        //
+        // Python architecture (SplitResidualVectorQuantizer):
+        // - rvq_first processes codebook 0 only
+        // - rvq_rest processes codebooks 1-15
+        //
+        // Inside ResidualVectorQuantizer.decode():
+        // 1. For each codebook: lookup embedding, transpose(1,2) → [batch, 256, seq]
+        // 2. Sum all codebook embeddings WITHIN the same RVQ
+        // 3. Apply output_proj (Conv1d) AFTER the sum
+        //
+        // So the correct order is:
+        // rvq_first: cb0 → transpose → output_proj
+        // rvq_rest: sum(cb1..cb15) → transpose → output_proj
+        // final: rvq_first + rvq_rest
 
-        for (i, (codebook, codebook_tokens)) in self.codebooks.iter().zip(tokens.iter()).enumerate()
+        // Process codebook 0 (rvq_first)
+        let token_ids_0: Vec<i64> = tokens[0].iter().map(|&t| t as i64).collect();
+        let token_tensor_0 = Tensor::new(token_ids_0.as_slice(), &self.device)?;
+        let emb_0 = self.codebooks[0].index_select(&token_tensor_0, 0)?; // [seq, 256]
+
+        // Debug: print first embedding values for verification
+        {
+            let emb_first_frame: Vec<f32> = emb_0.i(0)?.to_vec1()?;
+            debug_print!(
+                "DEBUG: cb0 embedding[0, :5] (token {}): {:?}",
+                tokens[0][0],
+                &emb_first_frame[..5.min(emb_first_frame.len())]
+            );
+            // Expected: [27.099, -18.818, -6.412, 4.171, 6.394] for token 1995
+        }
+
+        let emb_0 = emb_0.unsqueeze(0)?; // [1, seq, 256]
+        // Transpose to [1, 256, seq] for Conv1d
+        let emb_0_t = emb_0.transpose(1, 2)?;
+        // Apply output_proj: [1, 256, seq] → [1, 512, seq]
+        let rvq_first_out = rvq_first_proj.forward_conv(&emb_0_t)?;
+
+        // Debug: print projected values
+        {
+            let proj_first: Vec<f32> = rvq_first_out.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: rvq_first projected[:5, 0]: {:?}",
+                &proj_first[..5.min(proj_first.len())]
+            );
+            // Expected: [-6.599, -5.657, 45.555, -5.767, -2.078]
+        }
+
+        debug!("rvq_first output: {:?}", rvq_first_out.dims());
+
+        // Process codebooks 1-15 (rvq_rest)
+        // First sum all embeddings, then apply output_proj
+        let mut rvq_rest_sum: Option<Tensor> = None;
+        for (i, (codebook, codebook_tokens)) in
+            self.codebooks.iter().zip(tokens.iter()).enumerate().skip(1)
         {
             let token_ids: Vec<i64> = codebook_tokens.iter().map(|&t| t as i64).collect();
             let token_tensor = Tensor::new(token_ids.as_slice(), &self.device)?;
-
             // Lookup: [seq_len, 256]
             let emb = codebook.index_select(&token_tensor, 0)?;
-
             // Add batch dimension: [1, seq_len, 256]
             let emb = emb.unsqueeze(0)?;
+            // Transpose to [1, 256, seq]
+            let emb_t = emb.transpose(1, 2)?;
 
-            // Output projection: [1, seq_len, 256] → [1, 512, seq_len]
-            let proj_emb = if i == 0 {
-                rvq_first_proj.forward(&emb)?
-            } else {
-                rvq_rest_proj.forward(&emb)?
+            // Sum embeddings (residual sum within rvq_rest)
+            rvq_rest_sum = match rvq_rest_sum {
+                Some(s) => Some(s.add(&emb_t)?),
+                None => Some(emb_t),
             };
 
-            // Residual sum
-            sum_embedding = match sum_embedding {
-                Some(s) => Some((s + proj_emb)?),
-                None => Some(proj_emb),
-            };
+            if i == 1 {
+                // Can't use emb_t here since it's moved, but that's fine
+                debug!("rvq_rest codebook {} processed", i);
+            }
         }
 
-        let x =
-            sum_embedding.ok_or_else(|| candle_core::Error::Msg("No embeddings".to_string()))?;
+        // Apply output_proj to the sum
+        let rvq_rest_out = if let Some(ref sum) = rvq_rest_sum {
+            debug!("rvq_rest sum before proj: {:?}", sum.dims());
+            let proj = rvq_rest_proj.forward_conv(sum)?;
+            // Debug: print projected values
+            {
+                let proj_first: Vec<f32> = proj.i((0, .., 0))?.to_vec1()?;
+                debug_print!(
+                    "DEBUG: rvq_rest projected[:5, 0]: {:?}",
+                    &proj_first[..5.min(proj_first.len())]
+                );
+                // Expected: [14.281, 2.997, -2.655, -1.107, 9.266]
+            }
+            proj
+        } else {
+            // If no rest codebooks, create zeros
+            Tensor::zeros((1, 512, seq_len), candle_core::DType::F32, &self.device)?
+        };
+        debug!("rvq_rest output: {:?}", rvq_rest_out.dims());
+
+        // Final sum: rvq_first + rvq_rest
+        let x = (rvq_first_out + rvq_rest_out)?;
+        // Debug: print final quantizer output
+        {
+            let final_first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: quantizer output[:5, 0]: {:?}",
+                &final_first[..5.min(final_first.len())]
+            );
+            // Expected: [7.681, -2.659, 42.899, -6.874, 7.187]
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug_print!("DEBUG: quantizer output mean={:.4}, std={:.4}", mean, std);
+            // Expected: mean=0.1195, std=11.015
+        }
         debug!("After RVQ sum: {:?}", x.dims());
 
         // Debug: check embedding statistics
@@ -1374,21 +1455,94 @@ impl NeuralDecoder {
 
         // Step 3: Pre-conv [1024, 512, 3]
         let x = pre_conv.forward(&x)?;
+        // Debug pre_conv output
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: pre_conv output[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+            // Expected: [0.0212, 0.0001, -0.0005, 0.0001, 0.0503]
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug_print!("DEBUG: pre_conv output mean={:.4}, std={:.4}", mean, std);
+            // Expected: mean=0.0034, std=0.1215
+        }
         debug!("After pre_conv: {:?}", x.dims());
 
         // Step 4: Pre-Transformer (includes final norm)
         let x = pre_transformer.forward(&x)?;
+        // Debug pre_transformer output
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: pre_transformer output[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug_print!(
+                "DEBUG: pre_transformer output mean={:.4}, std={:.4}",
+                mean, std
+            );
+        }
         debug!("After pre_transformer: {:?}", x.dims());
 
         // Step 5: ConvNeXt upsample (4x total)
         let mut x = x;
         for (i, block) in convnext_upsample.iter().enumerate() {
             x = block.forward(&x)?;
+            // Debug: ConvNeXt output stats
+            {
+                let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+                debug_print!(
+                    "DEBUG: convnext_{} output[:5, 0]: {:?}",
+                    i,
+                    &first[..5.min(first.len())]
+                );
+                let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+                let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+                let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                    / x_flat.len() as f32)
+                    .sqrt();
+                debug_print!(
+                    "DEBUG: convnext_{} mean={:.6}, std={:.6}, shape={:?}",
+                    i,
+                    mean,
+                    std,
+                    x.dims()
+                );
+            }
             debug!("After ConvNeXt upsample block {}: {:?}", i, x.dims());
         }
 
         // Step 6: HiFi-GAN decoder
         let mut x = self.input_conv.forward(&x)?;
+        // Debug: input_conv output stats
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: input_conv output[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug_print!(
+                "DEBUG: input_conv mean={:.6}, std={:.6}, shape={:?}",
+                mean,
+                std,
+                x.dims()
+            );
+        }
         debug!("After input_conv: {:?}", x.dims());
 
         x = self.decode_hifi_gan(x)?;
@@ -1442,6 +1596,16 @@ impl NeuralDecoder {
             }
         }
 
+        // Debug: before final snake
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: before_final_snake[:5, 0]: {:?}, shape={:?}",
+                &first[..5.min(first.len())],
+                x.dims()
+            );
+        }
+
         // Final Snake activation
         if let Some(ref snake) = self.final_snake {
             let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
@@ -1467,6 +1631,15 @@ impl NeuralDecoder {
             }
 
             x = snake.forward(&x)?;
+
+            // Debug: after final snake
+            {
+                let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+                debug_print!(
+                    "DEBUG: after_final_snake[:5, 0]: {:?}",
+                    &first[..5.min(first.len())]
+                );
+            }
 
             let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
             let std_after: f32 =
@@ -1548,8 +1721,21 @@ impl NeuralDecoder {
                 std_before, std_after
             );
 
+            // Debug: after output_conv, before tanh
+            {
+                let first: Vec<f32> = x_out.i((0, 0, 0..10))?.to_vec1()?;
+                debug_print!("DEBUG: output_conv_out[:10]: {:?}", first);
+            }
+
             // Apply tanh
             let x_tanh = x_out.tanh()?;
+
+            // Debug: after tanh
+            {
+                let first: Vec<f32> = x_tanh.i((0, 0, 0..10))?.to_vec1()?;
+                debug_print!("DEBUG: after_tanh[:10]: {:?}", first);
+            }
+
             let x_flat: Vec<f32> = x_tanh.flatten_all()?.to_vec1()?;
             let std_tanh: f32 =
                 (x_flat.iter().map(|v| v.powi(2)).sum::<f32>() / x_flat.len() as f32).sqrt();
@@ -2016,6 +2202,23 @@ impl PreTransformer {
         let bias = self.input_proj_bias.unsqueeze(0)?.unsqueeze(0)?;
         let mut x = x.broadcast_add(&bias)?;
 
+        // Debug: check input_proj output
+        {
+            let first: Vec<f32> = x.i((0, 0, ..))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: pre_transformer input_proj[:5]: {:?}",
+                &first[..5.min(first.len())]
+            );
+            // Expected: [-0.00762, -0.11225, -0.01927, 0.01833, 0.01250]
+            let x_flat: Vec<f32> = x.flatten_all()?.to_vec1()?;
+            let mean: f32 = x_flat.iter().sum::<f32>() / x_flat.len() as f32;
+            let std: f32 = (x_flat.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                / x_flat.len() as f32)
+                .sqrt();
+            debug_print!("DEBUG: input_proj mean={:.6}, std={:.6}", mean, std);
+            // Expected: mean=-0.000834, std=0.055776
+        }
+
         // Transformer layers
         for layer in &self.layers {
             x = layer.forward(&x)?;
@@ -2057,6 +2260,9 @@ impl RvqOutputProj {
         Ok(Self { weight })
     }
 
+    /// Forward pass for input in [batch, seq_len, 256] format.
+    /// Output: [batch, 512, seq_len]
+    #[allow(dead_code)]
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // x: [batch, seq_len, 256]
         // Conv1d with kernel_size=1 is equivalent to a linear projection
@@ -2071,6 +2277,106 @@ impl RvqOutputProj {
         let out_flat = x_flat.matmul(&weight.t()?)?; // [batch*seq_len, 512]
         let out = out_flat.reshape((batch, seq_len, 512))?; // [batch, seq_len, 512]
         out.transpose(1, 2) // [batch, 512, seq_len]
+    }
+
+    /// Forward pass for input in Conv1d format [batch, 256, seq_len].
+    /// Output: [batch, 512, seq_len]
+    /// This matches PyTorch Conv1d behavior.
+    fn forward_conv(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // x: [batch, 256, seq_len]
+        // weight: [512, 256, 1] - Conv1d format (out_channels, in_channels, kernel)
+        let weight = self.weight.squeeze(2)?; // [512, 256]
+
+        // Transpose x to [batch, seq_len, 256] for matmul
+        let x_t = x.transpose(1, 2)?; // [batch, seq_len, 256]
+        let (batch, seq_len, _in_dim) = x_t.dims3()?;
+
+        // Matmul: [batch*seq_len, 256] @ [256, 512] = [batch*seq_len, 512]
+        let x_flat = x_t.reshape((batch * seq_len, 256))?;
+        let out_flat = x_flat.matmul(&weight.t()?)?;
+        let out = out_flat.reshape((batch, seq_len, 512))?; // [batch, seq_len, 512]
+
+        // Transpose back to [batch, 512, seq_len]
+        out.transpose(1, 2)
+    }
+}
+
+// =============================================================================
+// CausalConv1d - Conv1d with left-only (causal) padding
+// =============================================================================
+
+/// Causal Conv1d - pads on the left side following Qwen3-TTS CausalConvNet.
+///
+/// For kernel_size=K, dilation=D, stride=S:
+/// - effective_kernel = (K - 1) * D + 1
+/// - left_padding = effective_kernel - S
+/// - May add extra right padding for alignment
+#[derive(Debug)]
+struct CausalConv1d {
+    conv: Conv1d,
+    left_padding: usize,
+    stride: usize,
+    effective_kernel: usize,
+}
+
+impl CausalConv1d {
+    fn new(weight: Tensor, bias: Option<Tensor>, kernel_size: usize) -> Self {
+        Self::new_with_dilation(weight, bias, kernel_size, 1)
+    }
+
+    fn new_with_dilation(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        kernel_size: usize,
+        dilation: usize,
+    ) -> Self {
+        let stride = 1; // Default stride
+        let effective_kernel = (kernel_size - 1) * dilation + 1;
+        let left_padding = effective_kernel - stride;
+
+        let conv = Conv1d::new(
+            weight,
+            bias,
+            Conv1dConfig {
+                dilation,
+                ..Default::default()
+            },
+        );
+
+        Self {
+            conv,
+            left_padding,
+            stride,
+            effective_kernel,
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // Calculate extra padding for proper alignment (matching Python)
+        let length = x.dim(2)?;
+        let n_frames_float =
+            (length + self.left_padding - self.effective_kernel) as f32 / self.stride as f32 + 1.0;
+        let n_frames = n_frames_float.ceil() as usize;
+        let ideal_length = (n_frames - 1) * self.stride + self.effective_kernel;
+        let extra_padding = if ideal_length > length + self.left_padding {
+            ideal_length - length - self.left_padding
+        } else {
+            0
+        };
+
+        // Apply padding: left_padding on left, extra_padding on right
+        let x = if self.left_padding > 0 || extra_padding > 0 {
+            x.pad_with_zeros(2, self.left_padding, extra_padding)?
+        } else {
+            x.clone()
+        };
+
+        self.conv.forward(&x)
+    }
+
+    /// Get reference to weight tensor.
+    fn weight(&self) -> &Tensor {
+        self.conv.weight()
     }
 }
 
@@ -2220,7 +2526,7 @@ impl ConvNeXtBlock {
         x + residual
     }
 
-    /// Depthwise convolution (groups = channels).
+    /// Depthwise convolution (groups = channels) with CAUSAL padding.
     fn depthwise_conv(&self, x: &Tensor) -> CandleResult<Tensor> {
         // x: [batch, channels, seq_len]
         // weight: [channels, 1, 7] - one filter per channel
@@ -2228,10 +2534,11 @@ impl ConvNeXtBlock {
 
         let (_batch, channels, _seq_len) = x.dims3()?;
         let kernel_size = 7;
-        let padding = kernel_size / 2;
+        // CAUSAL padding: all padding on the left, none on the right
+        let left_padding = kernel_size - 1; // = 6
 
-        // Pad the input
-        let x_padded = x.pad_with_zeros(2, padding, padding)?;
+        // Pad the input (causal: left only)
+        let x_padded = x.pad_with_zeros(2, left_padding, 0)?;
 
         // Manual depthwise convolution
         let mut output_slices = Vec::with_capacity(channels);
@@ -2300,8 +2607,51 @@ impl ConvNeXtUpsampleBlock {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // x: [batch, channels, seq_len]
 
+        // Debug: before upsample
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: upsample_input[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
+
         // 2x upsample via ConvTranspose1d
         let x = self.upsample_conv.forward(x)?;
+
+        // Debug: after ConvTranspose1d, before trim
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: after_transconv[:5, 0]: {:?}, shape={:?}",
+                &first[..5.min(first.len())],
+                x.dims()
+            );
+        }
+
+        // Causal trimming for transposed convolution (matching Python CausalTransConvNet)
+        // Python formula: pad = kernel_size - stride; left_pad = right_pad = ceil(pad)
+        // For kernel=2, stride=2: pad = 0, so no trimming needed
+        // But this code was using kernel_size-1 = 1, which was WRONG
+        let seq_len = x.dims()[2];
+        let kernel_size = 2usize;
+        let stride = 2usize;
+        let pad = kernel_size.saturating_sub(stride); // = 0 for kernel=2, stride=2
+        let x = if pad > 0 {
+            x.narrow(2, pad, seq_len - 2 * pad)?
+        } else {
+            x // No trimming needed
+        };
+
+        // Debug: after trim, before ConvNeXt
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: after_trim[:5, 0]: {:?}, shape={:?}",
+                &first[..5.min(first.len())],
+                x.dims()
+            );
+        }
 
         // ConvNeXt block
         self.convnext.forward(&x)
@@ -2420,8 +2770,26 @@ impl HifiResBlock {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let residual = x.clone();
 
+        // Debug: input
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: resblock input[:5,0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
+
         // Apply Snake activation 1
         let x = self.act1.forward(x)?;
+
+        // Debug: after act1
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: resblock after_act1[:5,0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
 
         // Apply causal padding (left padding only) for conv1
         let x = if self.conv1_padding > 0 {
@@ -2430,6 +2798,16 @@ impl HifiResBlock {
             x
         };
         let x = self.conv1.forward(&x)?;
+
+        // Debug: after conv1
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: resblock after_conv1[:5,0]: {:?}, shape={:?}",
+                &first[..5.min(first.len())],
+                x.dims()
+            );
+        }
 
         // Apply Snake activation 2
         let x = self.act2.forward(&x)?;
@@ -2442,6 +2820,15 @@ impl HifiResBlock {
         };
         let x = self.conv2.forward(&x)?;
 
+        // Debug: after conv2
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: resblock after_conv2[:5,0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
+
         // Residual connection - ensure same length
         // Causal conv may produce different length, need to align
         let res_len = residual.dim(2)?;
@@ -2450,9 +2837,8 @@ impl HifiResBlock {
         if out_len == res_len {
             x + residual
         } else if out_len > res_len {
-            // Trim output to match residual (take last res_len samples)
-            let start = out_len - res_len;
-            x.narrow(2, start, res_len)? + residual
+            // Trim output to match residual (take FIRST res_len samples for causal)
+            x.narrow(2, 0, res_len)? + residual
         } else {
             // This shouldn't happen with proper causal padding
             Err(candle_core::Error::Msg(format!(
@@ -2505,10 +2891,12 @@ impl HifiUpsampleBlock {
 
         // Calculate trim amounts (matching Python CausalTransConvNet exactly)
         // Python formula:
-        //   trim_left = (kernel_size // 2) - 1
-        //   trim_right = kernel_size - stride
-        let trim_left = (kernel_size / 2).saturating_sub(1);
-        let trim_right = kernel_size.saturating_sub(upsample_factor);
+        //   pad = kernel_size - stride
+        //   left_pad = ceil(pad)
+        //   right_pad = left_pad
+        let pad = kernel_size.saturating_sub(upsample_factor);
+        let trim_left = pad; // Already integer, ceil is identity
+        let trim_right = pad;
         let upsample_trim = (trim_left, trim_right);
 
         let upsample_conv = conv_transpose1d(
@@ -2563,10 +2951,12 @@ impl HifiUpsampleBlock {
 
         // Calculate trim amounts (matching Python CausalTransConvNet exactly)
         // Python formula:
-        //   trim_left = (kernel_size // 2) - 1
-        //   trim_right = kernel_size - stride
-        let trim_left = (kernel_size / 2).saturating_sub(1);
-        let trim_right = kernel_size.saturating_sub(upsample_factor);
+        //   pad = kernel_size - stride
+        //   left_pad = ceil(pad)
+        //   right_pad = left_pad
+        let pad = kernel_size.saturating_sub(upsample_factor);
+        let trim_left = pad;
+        let trim_right = pad;
         let upsample_trim = (trim_left, trim_right);
 
         let w = Tensor::randn(
@@ -2600,7 +2990,23 @@ impl HifiUpsampleBlock {
 
     #[allow(dead_code)]
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // Debug: before snake
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: hifi_before_snake[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
         let x = self.snake.forward(x)?;
+        // Debug: after snake
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: hifi_after_snake[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
+        }
         let mut x = self.upsample_conv.forward(&x)?;
 
         // Apply causal trimming (matching Python CausalTransConvNet)
@@ -2614,8 +3020,27 @@ impl HifiUpsampleBlock {
             }
         }
 
+        // Debug: after transconv+trim
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: hifi_transconv[:5, 0]: {:?}, shape={:?}",
+                &first[..5.min(first.len())],
+                x.dims()
+            );
+        }
+
         for block in &self.res_blocks {
             x = block.forward(&x)?;
+        }
+
+        // Debug: after resblocks
+        {
+            let first: Vec<f32> = x.i((0, .., 0))?.to_vec1()?;
+            debug_print!(
+                "DEBUG: hifi_resblocks[:5, 0]: {:?}",
+                &first[..5.min(first.len())]
+            );
         }
 
         Ok(x)

@@ -9,7 +9,10 @@ use candle_core::Device;
 use tracing::{debug, info, instrument};
 
 use acoustic_model::{CodePredictor, CodePredictorConfig, Model as AcousticModel, SamplingConfig};
-use audio_codec_12hz::{Codec12Hz, DEFAULT_CROSSFADE_MS, StreamingDecoder};
+use audio_codec_12hz::{
+    Codec12Hz, DEFAULT_CROSSFADE_MS, StreamingDecoder, smooth_frame_boundaries_default,
+    smooth_silence_transitions_default,
+};
 use text_normalizer::Normalizer;
 use text_tokenizer::{MockTokenizer, Qwen3TTSTokens, Tokenizer};
 use tts_core::{
@@ -1255,6 +1258,13 @@ impl TtsPipeline {
 
         // 5. Decode using multi-codebook decoder
         let audio = self.codec.decode_multi(&multi_tokens)?;
+
+        // 6. Apply post-processing to smooth frame boundary discontinuities
+        let mut pcm: Vec<f32> = audio.pcm.to_vec();
+        smooth_frame_boundaries_default(&mut pcm);
+        smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
+        let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
+
         debug!(
             samples = audio.num_samples(),
             duration_ms = audio.duration_ms(),
@@ -1322,6 +1332,13 @@ impl TtsPipeline {
 
         // 4. Decode using multi-codebook decoder
         let audio = self.codec.decode_multi(&multi_tokens)?;
+
+        // 5. Apply post-processing to smooth frame boundary discontinuities
+        let mut pcm: Vec<f32> = audio.pcm.to_vec();
+        smooth_frame_boundaries_default(&mut pcm);
+        smooth_silence_transitions_default(&mut pcm, audio.sample_rate);
+        let audio = AudioChunk::new(pcm, audio.sample_rate, audio.start_ms, audio.end_ms);
+
         debug!(
             samples = audio.num_samples(),
             duration_ms = audio.duration_ms(),
