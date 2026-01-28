@@ -400,7 +400,7 @@ impl Model {
         for _ in 0..self.layers.len() {
             kv_caches.push(LayerKvCache::new(
                 64,
-                self.config.hidden_size,
+                self.config.head_dim,
                 self.config.num_kv_heads,
                 &self.device,
                 DType::F32,

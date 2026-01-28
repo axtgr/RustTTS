@@ -53,3 +53,6 @@ config/server.toml
 .python-version
 .venv*/
 __pycache__/
+
+# Article drafts
+HABR_ARTICLE.md
