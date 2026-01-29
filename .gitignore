@@ -35,6 +35,8 @@ config/server.toml
 *.wav
 *.mp3
 /output/
+!example/*.wav
+!example/*.mp3
 
 # Benchmarks
 /criterion/

@@ -291,19 +291,59 @@ impl TtsPipeline {
         model_config: &acoustic_model::AcousticModelConfig,
         device: &Device,
     ) -> Option<Arc<CodePredictor>> {
-        // Create CodePredictor config from main model config
+        // Attempt to read parsing code_predictor_config from config.json
+        // to get correct hidden_size (which may differ from talker hidden_size)
+        let mut hidden_size = model_config.hidden_size;
+        let mut num_layers = 5;
+        let mut num_attention_heads = model_config.num_attention_heads;
+        let mut num_kv_heads = model_config.num_kv_heads;
+        let mut intermediate_size = model_config.intermediate_size;
+        let mut head_dim = model_config.head_dim;
+        let mut num_code_groups = model_config.num_code_groups;
+        let mut codebook_size = model_config.codebook_size;
+        let mut max_position_embeddings = model_config.max_position_embeddings;
+        let mut rope_theta = model_config.rope_theta;
+        let mut rms_norm_eps = model_config.rms_norm_eps;
+
+        if let Some(model_dir) = weights_path.parent() {
+            let config_path = model_dir.join("config.json");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                   if let Some(cp_config) = json
+                        .get("talker_config")
+                        .and_then(|t| t.get("code_predictor_config"))
+                    {
+                        if let Some(v) = cp_config.get("hidden_size").and_then(|v| v.as_u64()) { hidden_size = v as usize; }
+                        if let Some(v) = cp_config.get("num_hidden_layers").and_then(|v| v.as_u64()) { num_layers = v as usize; }
+                        if let Some(v) = cp_config.get("num_attention_heads").and_then(|v| v.as_u64()) { num_attention_heads = v as usize; }
+                        if let Some(v) = cp_config.get("num_key_value_heads").and_then(|v| v.as_u64()) { num_kv_heads = v as usize; }
+                        if let Some(v) = cp_config.get("intermediate_size").and_then(|v| v.as_u64()) { intermediate_size = v as usize; }
+                        if let Some(v) = cp_config.get("head_dim").and_then(|v| v.as_u64()) { head_dim = v as usize; }
+                        if let Some(v) = cp_config.get("num_code_groups").and_then(|v| v.as_u64()) { num_code_groups = v as usize; }
+                        if let Some(v) = cp_config.get("codebook_size").and_then(|v| v.as_u64()) { codebook_size = v as usize; }
+                        if let Some(v) = cp_config.get("max_position_embeddings").and_then(|v| v.as_u64()) { max_position_embeddings = v as usize; }
+                        if let Some(v) = cp_config.get("rope_theta").and_then(|v| v.as_f64()) { rope_theta = v; }
+                        if let Some(v) = cp_config.get("rms_norm_eps").and_then(|v| v.as_f64()) { rms_norm_eps = v; }
+                        
+                        info!("Found code_predictor_config in config.json, using hidden_size={}", hidden_size);
+                    }
+                }
+            }
+        }
+
+        // Create CodePredictor config
         let cp_config = CodePredictorConfig {
-            hidden_size: model_config.hidden_size,
-            num_layers: 5, // Qwen3-TTS CodePredictor has 5 layers
-            num_attention_heads: model_config.num_attention_heads,
-            num_kv_heads: model_config.num_kv_heads,
-            intermediate_size: model_config.intermediate_size,
-            head_dim: model_config.head_dim,
-            num_code_groups: model_config.num_code_groups,
-            codebook_size: model_config.codebook_size,
-            max_position_embeddings: model_config.max_position_embeddings,
-            rope_theta: model_config.rope_theta,
-            rms_norm_eps: model_config.rms_norm_eps,
+            hidden_size,
+            num_layers,
+            num_attention_heads,
+            num_kv_heads,
+            intermediate_size,
+            head_dim,
+            num_code_groups,
+            codebook_size,
+            max_position_embeddings,
+            rope_theta,
+            rms_norm_eps,
         };
 
         match CodePredictor::load(weights_path, cp_config, device) {

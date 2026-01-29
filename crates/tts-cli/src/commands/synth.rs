@@ -58,10 +58,26 @@ fn create_pipeline(options: &SynthOptions) -> Result<TtsPipeline> {
                 .unwrap_or_else(|| PathBuf::from("models/qwen3-tts-tokenizer"))
         });
 
-        // Ensure model.safetensors exists to avoid silent fallback to Mock
-        if !model_dir.join("model.safetensors").exists() {
+        // Ensure model weights exist (safetensors or GGUF)
+        let has_safetensors = model_dir.join("model.safetensors").exists();
+        let has_gguf = std::fs::read_dir(model_dir)
+            .map(|mut entries| {
+                entries.any(|e| {
+                    e.map(|e| {
+                        let path = e.path();
+                        path.extension().map_or(false, |ext| ext == "gguf")
+                            && path
+                                .file_name()
+                                .map_or(false, |n| n.to_string_lossy().starts_with("model"))
+                    })
+                    .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if !has_safetensors && !has_gguf {
             bail!(
-                "Acoustic model weights (model.safetensors) not found in directory: {}",
+                "Acoustic model weights (model.safetensors or model*.gguf) not found in directory: {}",
                 model_dir.display()
             );
         }

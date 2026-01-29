@@ -120,6 +120,21 @@ enum Commands {
 
     /// Show version and configuration info
     Info,
+
+    /// Quantize a model to GGUF
+    Quantize {
+        /// Input model file or directory
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output GGUF file path
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Quantization type (q4_0)
+        #[arg(long, default_value = "q4_0")]
+        qtype: String,
+    },
 }
 
 #[tokio::main]
@@ -189,6 +204,18 @@ async fn main() -> Result<()> {
         }
         Commands::Info => {
             commands::info::run();
+        }
+        Commands::Quantize {
+            input,
+            output,
+            qtype,
+        } => {
+            let options = commands::quantize::QuantizeOptions {
+                input,
+                output,
+                qtype,
+            };
+            commands::quantize::run(options).context("quantization failed")?;
         }
     }
 

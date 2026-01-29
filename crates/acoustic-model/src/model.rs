@@ -164,28 +164,27 @@ impl Model {
             )
         })?;
 
-        // Text projection: embedding_dim -> hidden_size
-        // Only needed if embedding_dim != hidden_size
-        let text_projection = if config.embedding_dim != config.hidden_size {
-            match TextProjection::new(
-                config.embedding_dim,
-                config.hidden_size,
-                vb_talker.pp("text_projection"),
-            ) {
-                Ok(proj) => {
-                    info!(
-                        "Loaded text_projection: {} -> {}",
-                        config.embedding_dim, config.hidden_size
-                    );
-                    Some(proj)
+        // Text projection
+        // Qwen3-TTS uses a text projection layer (FC1 -> SiLU -> FC2) even if
+        // embedding_dim == hidden_size (as seen in 1.7B model).
+        // We always try to load it.
+        let text_projection_res = TextProjection::new(
+            config.embedding_dim,
+            config.hidden_size,
+            vb_talker.pp("text_projection"),
+        );
+
+        let text_projection = match text_projection_res {
+            Ok(tp) => Some(tp),
+            Err(e) => {
+                if config.embedding_dim != config.hidden_size {
+                    // If dims differ, we MUST have a projection
+                    candle_core::bail!("Missing text_projection weights but embedding_dim != hidden_size: {}", e);
                 }
-                Err(e) => {
-                    warn!("Failed to load text_projection: {}", e);
-                    None
-                }
+                // If dims match and no weights, assume identity
+                info!("No text_projection found, using identity (dims match): {}", e);
+                None
             }
-        } else {
-            None
         };
 
         // Codec embedding layer [codec_vocab_size, hidden_size]

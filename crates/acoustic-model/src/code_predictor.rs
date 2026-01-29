@@ -43,6 +43,10 @@ pub struct CodePredictor {
     /// Output heads for each residual codebook (predicts codebook i+1).
     /// lm_heads[i] outputs logits for codebook i+1.
     lm_heads: Vec<LinearLayer>,
+    /// Input projection layer (optional).
+    /// Used when Talker hidden size != CodePredictor hidden size (e.g. 1.7B model).
+    /// Projects Talker hidden states to CodePredictor hidden size.
+    input_projection: Option<LinearLayer>,
     /// Rotary position embeddings.
     rotary_emb: RotaryEmbedding,
     /// Model configuration.
@@ -89,15 +93,41 @@ impl CodePredictor {
         let vb_predictor = weights.pp("talker").pp("code_predictor");
         let vb_model = vb_predictor.pp("model");
 
+        // Input projection (optional)
+        // Qwen3-TTS 1.7B: talker.code_predictor.small_to_mtp_projection [1024, 2048]
+        // Note: The naming "small_to_mtp" is specific to Qwen3 code, but we check generically
+        // If weights exist, we load dimension from weights, but we expect out_dim = config.hidden_size
+        // We speculatively check for 2048 -> hidden_size projection.
+        let input_projection = match crate::layers::linear(
+            2048, // Expected input dim for 1.7B model
+            config.hidden_size, // Out dim must match CP hidden size
+            vb_predictor.pp("small_to_mtp_projection"),
+        ) {
+            Ok(proj) => {
+                info!("Loaded input projection for CodePredictor");
+                Some(proj)
+            }
+            Err(_) => None,
+        };
+
+        // Determine actual embedding dimension.
+        // If projection exists, embeddings are 2048.
+        // Otherwise, they match hidden_size (1024).
+        let embedding_dim = if input_projection.is_some() {
+            2048
+        } else {
+            config.hidden_size
+        };
+
         let num_residual_groups = config.num_code_groups - 1; // 15 for Qwen3-TTS
 
         // Separate codec embeddings for each residual codebook
-        // Qwen3-TTS: talker.code_predictor.model.codec_embedding.{0-14}.weight [2048, 1024]
+        // Qwen3-TTS: talker.code_predictor.model.codec_embedding.{0-14}.weight [2048, 1024] OR [2048, 2048]
         let mut codec_embeddings = Vec::with_capacity(num_residual_groups);
         for i in 0..num_residual_groups {
             let emb = embedding_from_weights(
                 config.codebook_size,
-                config.hidden_size,
+                embedding_dim,
                 vb_model.pp(format!("codec_embedding.{i}")),
             )?;
             codec_embeddings.push(emb);
@@ -111,7 +141,7 @@ impl CodePredictor {
         // CodePredictor does NOT use multimodal RoPE - it uses standard RoPE
         let acoustic_config = crate::config::AcousticModelConfig {
             hidden_size: config.hidden_size,
-            embedding_dim: config.hidden_size, // Same as hidden_size for code predictor
+            embedding_dim: config.hidden_size, // Layers still use hidden_size
             num_attention_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             num_layers: config.num_layers,
@@ -172,8 +202,8 @@ impl CodePredictor {
         )?;
 
         info!(
-            "CodePredictor loaded: {} layers, {} residual codebooks, hidden={}",
-            config.num_layers, num_residual_groups, config.hidden_size
+            "CodePredictor loaded: {} layers, {} residual codebooks, hidden={}, has_proj={}",
+            config.num_layers, num_residual_groups, config.hidden_size, input_projection.is_some()
         );
 
         Ok(Self {
@@ -181,11 +211,13 @@ impl CodePredictor {
             layers,
             norm,
             lm_heads,
+            input_projection,
             rotary_emb,
             config,
             device: device.clone(),
         })
     }
+
 
     /// Create CodePredictor with random weights (for testing).
     pub fn new_random(config: CodePredictorConfig, device: &Device) -> Result<Self> {
@@ -233,6 +265,7 @@ impl CodePredictor {
             layers,
             norm,
             lm_heads,
+            input_projection: None,
             rotary_emb,
             config,
             device: device.clone(),
@@ -361,6 +394,18 @@ impl CodePredictor {
     ) -> Result<Tensor> {
         let (batch_size, _, _) = hidden_states.dims3()?;
 
+        // Apply input projection if available (e.g. for 1.7B model)
+        // Projects Talker hidden states (2048) to CodePredictor hidden size (1024)
+        let (hidden_states_proj, zeroth_embed_proj) = if let Some(ref proj) = self.input_projection
+        {
+            let h = proj.forward(hidden_states)?;
+            let z = proj.forward(zeroth_embed)?;
+            debug!("Applied input projection to hidden_states and zeroth_embed");
+            (h, z)
+        } else {
+            (hidden_states.clone(), zeroth_embed.clone())
+        };
+
         // Initialize output with zeroth codebook
         let mut all_codes = vec![zeroth_codes.clone()];
 
@@ -370,12 +415,12 @@ impl CodePredictor {
         // last_id_hidden = embedding of zeroth codebook token
 
         // Debug: print first 20 values of hidden_states for comparison with Python
-        let hs_values: Vec<f32> = hidden_states.i((0, 0, ..20))?.to_vec1()?;
+        let hs_values: Vec<f32> = hidden_states_proj.i((0, 0, ..20))?.to_vec1()?;
         info!("CodePredictor past_hidden first 20: {:?}", hs_values);
-        let ze_values: Vec<f32> = zeroth_embed.i((0, 0, ..20))?.to_vec1()?;
+        let ze_values: Vec<f32> = zeroth_embed_proj.i((0, 0, ..20))?.to_vec1()?;
         info!("CodePredictor zeroth_embed first 20: {:?}", ze_values);
 
-        let prefill_embeds = Tensor::cat(&[hidden_states, zeroth_embed], 1)?; // [batch, 2, hidden]
+        let prefill_embeds = Tensor::cat(&[hidden_states_proj, zeroth_embed_proj], 1)?; // [batch, 2, hidden]
         debug!(
             "CodePredictor prefill: embeds shape {:?}",
             prefill_embeds.dims()
@@ -431,7 +476,12 @@ impl CodePredictor {
         for gen_step in 1..15 {
             // Python: inputs_embeds = self.model.get_input_embeddings()[generation_steps - 1](input_ids)
             // generation_steps = gen_step, so we use codec_embedding[gen_step - 1]
-            let input_embed = self.codec_embeddings[gen_step - 1].forward(&predicted_code)?; // [batch, 1, hidden]
+            let mut input_embed = self.codec_embeddings[gen_step - 1].forward(&predicted_code)?; // [batch, 1, embedding_dim]
+
+            // Apply projection if available (e.g. 2048 -> 1024)
+            if let Some(ref proj) = self.input_projection {
+                input_embed = proj.forward(&input_embed)?;
+            }
 
             // Pass through transformer layers with KV cache
             let mut current_hidden = input_embed;
