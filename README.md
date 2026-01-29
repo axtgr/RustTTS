@@ -23,6 +23,8 @@
 
 ## Быстрый старт
 
+Проект использует protobuf, поэтому для сборки должен быть установлен [protoc](https://github.com/protocolbuffers/protobuf/releases).
+
 ### Apple Silicon (Metal) ускорение
 
 Для владельцев Apple Silicon (включая M4) можно использовать feature-флаг `metal` для инференса на GPU (MPS).
